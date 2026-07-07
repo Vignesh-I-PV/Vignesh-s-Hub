@@ -52,12 +52,28 @@ const STATUS_META = {
   done:     { label: 'Done',        color: 'var(--green)' }
 };
 
+// A task "appears" on a given day if that day falls in its [start, end] range, OR —
+// for tasks that aren't done — on every day after it started, since it should keep
+// showing up until it's actually marked done (whether it's overdue past its end date,
+// or in progress past its start date with no end date set yet).
+function taskMatchesRange(task, rangeStart, rangeEnd){
+  const { startDate, endDate, status } = task;
+  if (!startDate && !endDate) return false;
+  const s = startDate || endDate;
+  const e = endDate || startDate;
+  if (status === 'done') return s <= rangeEnd && e >= rangeStart;
+  return s <= rangeEnd;
+}
+
+function taskAppearsOn(task, dateISO){
+  return taskMatchesRange(task, dateISO, dateISO);
+}
+
 function matchesTaskFilter(task, filter, today, weekStart, weekEnd, monthStart, monthEnd){
   if (filter === 'all') return true;
-  if (!task.due) return false;
-  if (filter === 'today') return task.due === today;
-  if (filter === 'week') return task.due >= weekStart && task.due <= weekEnd;
-  if (filter === 'month') return task.due >= monthStart && task.due <= monthEnd;
+  if (filter === 'today') return taskMatchesRange(task, today, today);
+  if (filter === 'week') return taskMatchesRange(task, weekStart, weekEnd);
+  if (filter === 'month') return taskMatchesRange(task, monthStart, monthEnd);
   return true;
 }
 
@@ -122,10 +138,10 @@ function categoryById(categories, id){
 // treating it as overdue/delayed — the person made a deliberate call, it isn't slipping
 // silently. If it's never been revised, fall back to the normal due-soon/overdue read.
 function dueStatusInfo(task, today){
-  if (!task.due || task.status === 'done') return null;
+  if (!task.endDate || task.status === 'done') return null;
   const extended = task.dueRevisions && task.dueRevisions.length > 0;
   if (extended) return { label: 'Extended', color: 'var(--purple)', cssClass: 'extended' };
-  const daysDiff = Math.round((new Date(task.due) - new Date(today)) / 86400000);
+  const daysDiff = Math.round((new Date(task.endDate) - new Date(today)) / 86400000);
   if (daysDiff < 0) return { label: `Overdue ${Math.abs(daysDiff)}d`, color: 'var(--red)', cssClass: 'overdue' };
   if (daysDiff === 0) return { label: 'Due today', color: 'var(--red)', cssClass: 'due-soon' };
   if (daysDiff === 1) return { label: 'Due tomorrow', color: 'var(--amber)', cssClass: 'due-soon' };
@@ -145,33 +161,20 @@ function getSeedData(){
   return {
     categories: DEFAULT_CATEGORIES,
     categoryCounter: DEFAULT_CATEGORIES.length + 1,
-    meetings: [
-      { id: uid(), name: 'Sprint Planning',  type: 'sprint',   weekday: 0, time: '10:00', cadence: 'weekly',      parity: 'A' },
-      { id: uid(), name: 'POD Connect',      type: 'pod',      weekday: 1, time: '11:00', cadence: 'weekly',      parity: 'A' },
-      { id: uid(), name: 'Mentor Sync',      type: 'mentor',   weekday: 3, time: '16:00', cadence: 'fortnightly', parity: 'A' },
-      { id: uid(), name: 'Sprint Review',    type: 'sprint',   weekday: 4, time: '17:00', cadence: 'weekly',      parity: 'A' },
-      { id: uid(), name: 'Champion Review',  type: 'champion', weekday: 4, time: '15:00', cadence: 'fortnightly', parity: 'B' }
-    ],
+    meetings: [],
     tasks: [
-      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, due: todayISO(), notes: '', link: '', closingRemark: '' },
-      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, due: '',         notes: '', link: '', closingRemark: '' },
-      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, due: '',         notes: '', link: '', closingRemark: '' },
-      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  due: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '' }
+      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, startDate: '', endDate: todayISO(), notes: '', link: '', closingRemark: '' },
+      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '' },
+      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '' },
+      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  startDate: '', endDate: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '' }
     ],
     quickLinks: [
       { id: uid(), label: 'PRD Master Folder',    url: 'https://drive.google.com',  type: 'drive', tag: 'Masters' },
       { id: uid(), label: 'Sprint Tracker Sheet', url: 'https://sheets.google.com', type: 'sheet', tag: 'Quick Access' }
     ],
     linkTags: DEFAULT_LINK_TAGS,
-    pendingMeetings: [
-      { id: uid(), title: 'Vendor kickoff — need to align with procurement first', targetDate: '', notes: '' }
-    ],
-    plannedMeetings: [
-      { id: uid(), title: 'Design review with core team', date: todayISO(), time: '14:00', agenda: [
-        { id: uid(), text: 'Walk through updated onboarding flow', done: false },
-        { id: uid(), text: 'Confirm scope for next sprint', done: false }
-      ], notes: '' }
-    ]
+    pendingMeetings: [],
+    plannedMeetings: []
   };
 }
 
@@ -186,42 +189,83 @@ function StatChip({ label, value, tone, onClick }){
   );
 }
 
-function DeadlineChip({ task, category, onClick }){
-  const today = todayISO();
-  const status = dueStatusInfo(task, today) || { label: 'Due', color: 'var(--amber)' };
+function DeadlineChip({ task, category, onClick, onFocusClick }){
+  const status = dueStatusInfo(task, todayISO()) || { label: 'Due', color: 'var(--amber)' };
   return (
-    <div className="deadline-chip" style={{ '--dchip-color': status.color }} onClick={onClick} role="button" tabIndex={0}>
-      <span className="deadline-chip__code">{category ? category.code : '—'}</span>
-      <span className="deadline-chip__title">{task.title}</span>
-      <span className="deadline-chip__when">{status.label}</span>
+    <div className="deadline-chip" style={{ '--dchip-color': status.color }}>
+      <div onClick={onClick} role="button" tabIndex={0} style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer' }}>
+        <span className="deadline-chip__code">{category ? category.code : '—'}</span>
+        <span className="deadline-chip__title">{task.title}</span>
+        <span className="deadline-chip__when">{status.label}</span>
+      </div>
+      <button className="deadline-chip__focus" title="Set focus time" onClick={e => { e.stopPropagation(); onFocusClick(); }}>&#127919;</button>
     </div>
   );
 }
 
-function TodaysDues({ meetings, plannedMeetings, pendingMeetings, tasks, categories, todayIdx, realParity, onClickMeeting, onClickTask }){
+function FocusTimeModal({ task, onClose, onSave }){
+  const [date, setDate] = useState(todayISO());
+  const [time, setTime] = useState('10:00');
+
+  useEffect(() => {
+    function onKey(e){ if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  if (!task) return null;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">Focus time for</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 17, fontWeight: 600, marginTop: 2 }}>{task.title}</div>
+          </div>
+          <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
+        </div>
+        <div className="modal-grid">
+          <div>
+            <label>Date</label>
+            <input type="date" value={date} onChange={e => setDate(e.target.value)} />
+          </div>
+          <div>
+            <label>Time</label>
+            <input type="time" value={time} onChange={e => setTime(e.target.value)} />
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn--amber" onClick={() => onSave(date, time)}>Add to calendar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TodayMeetingsCard({ meetings, plannedMeetings, pendingMeetings, todayIdx, realParity, onClickMeeting }){
   const today = todayISO();
-  const todayMeetings = meetings
+  const todayRecurring = meetings
     .filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity))
     .sort((a, b) => a.time.localeCompare(b.time));
-  const todayPlanned = plannedMeetings.filter(m => m.date === today).sort((a, b) => a.time.localeCompare(b.time));
+  const todayPlanned = plannedMeetings.filter(m => m.date === today).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
   const todayReminders = pendingMeetings.filter(m => needsReminder(m, today));
-  const todayTasks = tasks.filter(t => t.due === today && t.status !== 'done');
-
-  const nothing = todayMeetings.length === 0 && todayPlanned.length === 0 && todayReminders.length === 0 && todayTasks.length === 0;
+  const nothing = todayRecurring.length === 0 && todayPlanned.length === 0 && todayReminders.length === 0;
 
   return (
     <section className="panel">
       <div className="panel__head" style={{ marginBottom: 10 }}>
         <div>
           <p className="panel__eyebrow">Today</p>
-          <h2 className="panel__title">{WEEKDAY_LABELS[todayIdx]}'s syncs &amp; dues</h2>
+          <h2 className="panel__title">Meetings</h2>
         </div>
       </div>
       {nothing ? (
-        <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>Nothing scheduled or due today. Clear runway.</p>
+        <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>No syncs today. Clear runway.</p>
       ) : (
         <div className="today-list">
-          {todayMeetings.map(m => {
+          {todayRecurring.map(m => {
             const mt = MEETING_TYPES[m.type];
             return (
               <div key={m.id} className="today-item" style={{ '--type-color': mt.color }} onClick={onClickMeeting}>
@@ -231,13 +275,18 @@ function TodaysDues({ meetings, plannedMeetings, pendingMeetings, tasks, categor
               </div>
             );
           })}
-          {todayPlanned.map(m => (
-            <div key={m.id} className="today-item" style={{ '--type-color': 'var(--purple)' }} onClick={onClickMeeting}>
-              <span className="today-item__time">{m.time}</span>
-              <span className="today-item__title">{m.title}</span>
-              <span className="pill" style={{ '--pill-color': 'var(--purple)', '--pill-bg': 'var(--purple-dim)' }}>Meeting</span>
-            </div>
-          ))}
+          {todayPlanned.map(m => {
+            const isFocus = m.kind === 'focus';
+            const color = isFocus ? 'var(--green)' : 'var(--purple)';
+            const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
+            return (
+              <div key={m.id} className="today-item" style={{ '--type-color': color }} onClick={onClickMeeting}>
+                <span className="today-item__time">{m.time || '—'}</span>
+                <span className="today-item__title">{m.title}</span>
+                <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>
+              </div>
+            );
+          })}
           {todayReminders.map(m => (
             <div key={m.id} className="today-item" style={{ '--type-color': 'var(--red)' }} onClick={onClickMeeting}>
               <span className="today-item__time" style={{ color: 'var(--red)' }}>&#128276;</span>
@@ -245,13 +294,38 @@ function TodaysDues({ meetings, plannedMeetings, pendingMeetings, tasks, categor
               <span className="pill" style={{ '--pill-color': 'var(--red)', '--pill-bg': 'var(--red-dim)' }}>Set up</span>
             </div>
           ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function TodayTasksCard({ tasks, categories, onClickTask }){
+  const today = todayISO();
+  const todayTasks = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today));
+
+  return (
+    <section className="panel">
+      <div className="panel__head" style={{ marginBottom: 10 }}>
+        <div>
+          <p className="panel__eyebrow">Today</p>
+          <h2 className="panel__title">Tasks</h2>
+        </div>
+      </div>
+      {todayTasks.length === 0 ? (
+        <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>Nothing active today. Clear runway.</p>
+      ) : (
+        <div className="today-list">
           {todayTasks.map(t => {
             const cat = categoryById(categories, t.theme);
+            const status = dueStatusInfo(t, today);
+            const label = status ? status.label : (t.startDate && t.startDate <= today ? 'In progress' : 'Active');
+            const color = status ? status.color : 'var(--cyan)';
             return (
               <div key={t.id} className="today-item" onClick={() => onClickTask(t.id)}>
                 <span className="today-item__time" style={{ color: 'var(--text-faint)' }}>{cat ? cat.code : '—'}</span>
                 <span className="today-item__title">{t.title}</span>
-                <span className="pill" style={{ '--pill-color': 'var(--amber)', '--pill-bg': 'var(--amber-dim)' }}>Due today</span>
+                <span className="pill" style={{ '--pill-color': color, '--pill-bg': 'var(--ink-700)' }}>{label}</span>
               </div>
             );
           })}
@@ -324,7 +398,7 @@ function AddMeetingForm({ open, onCancel, onSubmit }){
   );
 }
 
-function ScheduleBoard({ meetings, tasks, categories, weekOffset, setWeekOffset, onDeleteMeeting, onCycleTask, addOpen, setAddOpen, onAddMeeting }){
+function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, addOpen, setAddOpen, onAddMeeting }){
   const monday = getMonday(new Date(Date.now() + weekOffset * 7 * 86400000));
   const parity = getParity(monday);
   const sunday = new Date(monday); sunday.setDate(sunday.getDate() + 6);
@@ -341,7 +415,7 @@ function ScheduleBoard({ meetings, tasks, categories, weekOffset, setWeekOffset,
       <div className="panel__head">
         <div>
           <p className="panel__eyebrow">Weekly Flight Schedule</p>
-          <h2 className="panel__title">POD · Mentor · Champion · Sprint syncs</h2>
+          <h2 className="panel__title">Recurring syncs &amp; scheduled meetings</h2>
         </div>
         <div className="week-nav">
           <button className="btn" onClick={() => setWeekOffset(w => w - 1)}>&larr; Prev</button>
@@ -360,46 +434,55 @@ function ScheduleBoard({ meetings, tasks, categories, weekOffset, setWeekOffset,
           const isToday = d.toDateString() === todayStr;
           const iso = isoOf(d);
           const dayMeetings = meetingsForDay(i);
-          const dueTasks = tasks.filter(t => t.due === iso);
+          const dayPlanned = plannedMeetings.filter(m => m.date === iso).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+          const dayPlaceholders = pendingMeetings.filter(m => m.targetDate === iso);
+          const hasAnything = dayMeetings.length > 0 || dayPlanned.length > 0 || dayPlaceholders.length > 0;
           return (
             <div key={i} className={`schedule-day${isToday ? ' is-today' : ''}`}>
               <div className="schedule-day__head">{WEEKDAY_LABELS[i]}<b>{d.getDate()} {MONTHS[d.getMonth()]}</b></div>
               <div className="schedule-day__list">
-                {dayMeetings.length === 0 ? (
+                {!hasAnything ? (
                   <div className="schedule-day__empty">No syncs</div>
-                ) : dayMeetings.map(m => {
-                  const t = MEETING_TYPES[m.type];
-                  return (
-                    <div key={m.id} className="meeting-block" style={{ '--type-color': t.color }}>
-                      <button className="meeting-block__del" title="Remove" onClick={() => onDeleteMeeting(m.id)}>&times;</button>
-                      <div className="meeting-block__time">{m.time}</div>
-                      <div className="meeting-block__name">{m.name}</div>
-                      <div className="meeting-block__foot">
-                        <span className="pill" style={{ '--pill-color': t.color, '--pill-bg': t.dim }}>{t.label}</span>
-                        <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.cadence === 'weekly' ? 'WK' : 'FN'}</span>
+                ) : (
+                  <React.Fragment>
+                    {dayMeetings.map(m => {
+                      const t = MEETING_TYPES[m.type];
+                      return (
+                        <div key={m.id} className="meeting-block" style={{ '--type-color': t.color }}>
+                          <button className="meeting-block__del" title="Remove" onClick={() => onDeleteMeeting(m.id)}>&times;</button>
+                          <div className="meeting-block__time">{m.time}</div>
+                          <div className="meeting-block__name">{m.name}</div>
+                          <div className="meeting-block__foot">
+                            <span className="pill" style={{ '--pill-color': t.color, '--pill-bg': t.dim }}>{t.label}</span>
+                            <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.cadence === 'weekly' ? 'WK' : 'FN'}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {dayPlanned.map(m => {
+                      const isFocus = m.kind === 'focus';
+                      const color = isFocus ? 'var(--green)' : 'var(--purple)';
+                      const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
+                      return (
+                        <div key={m.id} className="meeting-block" style={{ '--type-color': color }}>
+                          <button className="meeting-block__del" title="Remove" onClick={() => onDeletePlanned(m.id)}>&times;</button>
+                          <div className="meeting-block__time">{m.time || '—'}</div>
+                          <div className="meeting-block__name">{m.title}</div>
+                          <div className="meeting-block__foot">
+                            <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {dayPlaceholders.map(m => (
+                      <div key={m.id} className="placeholder-block" title="Needs a confirmed slot — set it up from Meetings To Be Set Up">
+                        <div className="placeholder-block__name">{m.title}</div>
+                        <span className="pill" style={{ '--pill-color': 'var(--amber)', '--pill-bg': 'var(--amber-dim)' }}>Needs setup</span>
                       </div>
-                    </div>
-                  );
-                })}
+                    ))}
+                  </React.Fragment>
+                )}
               </div>
-              {dueTasks.length > 0 && (
-                <div className="schedule-day__deadlines">
-                  {dueTasks.map(t => {
-                    const cat = categoryById(categories, t.theme) || { chip: 'var(--text-lo)', title: 'Uncategorised' };
-                    return (
-                      <div
-                        key={t.id}
-                        className={`deadline-mini${t.status === 'done' ? ' is-done' : ''}`}
-                        style={{ '--sdchip-color': cat.chip }}
-                        title={`${cat.title} — click to update status`}
-                        onClick={() => onCycleTask(t.id)}
-                      >
-                        {t.title}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
             </div>
           );
         })}
@@ -756,7 +839,8 @@ function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteT
 function QuickAddPanel({ categories, tasks, onAddTask, onAddCategory, onDeleteCategory }){
   const [title, setTitle] = useState('');
   const [categoryId, setCategoryId] = useState(categories[0] ? categories[0].id : '');
-  const [due, setDue] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
   const [manageOpen, setManageOpen] = useState(false);
   const [newCatName, setNewCatName] = useState('');
 
@@ -768,8 +852,8 @@ function QuickAddPanel({ categories, tasks, onAddTask, onAddCategory, onDeleteCa
 
   function submitTask(){
     if (!title.trim() || !categoryId) return;
-    onAddTask(categoryId, title.trim(), due);
-    setTitle(''); setDue('');
+    onAddTask(categoryId, title.trim(), startDate, endDate);
+    setTitle(''); setStartDate(''); setEndDate('');
   }
 
   function submitCategory(){
@@ -799,7 +883,8 @@ function QuickAddPanel({ categories, tasks, onAddTask, onAddCategory, onDeleteCa
         <select value={categoryId} onChange={e => setCategoryId(e.target.value)}>
           {categories.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
         </select>
-        <input type="date" value={due} onChange={e => setDue(e.target.value)} />
+        <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} title="Start date (optional)" />
+        <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} title="End date (optional)" />
         <button className="btn btn--amber" onClick={submitTask}>Add task</button>
       </div>
 
@@ -842,8 +927,9 @@ function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onRe
   const today = todayISO();
   const dueStatus = dueStatusInfo(task, today);
   const dueClass = dueStatus ? ` ${dueStatus.cssClass}` : '';
-  const dueTitle = dueStatus ? dueStatus.label : '';
+  const dueTitle = dueStatus ? dueStatus.label : 'End date';
   const hasContent = (task.notes && task.notes.trim()) || (task.closingRemark && task.closingRemark.trim()) || task.link;
+  const hasHistory = task.dueRevisions && task.dueRevisions.length > 0;
 
   function handleStatusChange(e){
     const value = e.target.value;
@@ -851,9 +937,9 @@ function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onRe
     if (value === 'done') onOpenDetail(); // surface the (optional) closing-remark field right away
   }
 
-  function handleDueChange(e){
+  function handleEndDateChange(e){
     const newVal = e.target.value;
-    const isRevision = task.due && newVal && newVal !== task.due;
+    const isRevision = task.endDate && newVal && newVal !== task.endDate;
     onReviseDue(newVal);
     if (isRevision) onOpenDetail(); // surface the (optional) revision remark right away
   }
@@ -872,15 +958,23 @@ function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onRe
       </select>
       <input className={`task-title${task.status === 'done' ? ' is-done' : ''}`} type="text" value={task.title}
         onChange={e => onUpdate({ title: e.target.value })} />
-      <input className={`task-due${dueClass}`} type="date" value={task.due || ''} title={dueTitle}
-        onChange={handleDueChange} />
+      <div className="date-range">
+        <input className="task-due" type="date" value={task.startDate || ''} title="Start date"
+          onChange={e => onUpdate({ startDate: e.target.value })} />
+        <span className="date-range__arrow">&rarr;</span>
+        <div className="due-wrap">
+          <input className={`task-due${dueClass}`} type="date" value={task.endDate || ''} title={dueTitle}
+            onChange={handleEndDateChange} />
+          {hasHistory && <span className="extended-dot" title={`Deadline extended ${task.dueRevisions.length}\u00d7`} />}
+        </div>
+      </div>
       <button className={`icon-btn${task.atRisk ? ' flag-on' : ''}`} title="Flag at risk" onClick={onToggleRisk}>&#9873;</button>
       <button className={`icon-btn${hasContent ? ' link-on' : ''}`} title="Open details & notes" onClick={onOpenDetail}>&#8942;</button>
     </div>
   );
 }
 
-function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onReviseDue }){
+function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onReviseDue, onSetFocusTime }){
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
     document.addEventListener('keydown', onKey);
@@ -891,9 +985,9 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
 
   const revisions = task.dueRevisions || [];
 
-  function handleDueChange(e){
+  function handleEndDateChange(e){
     const newVal = e.target.value;
-    const isRevision = task.due && newVal && newVal !== task.due;
+    const isRevision = task.endDate && newVal && newVal !== task.endDate;
     onReviseDue(newVal);
     return isRevision;
   }
@@ -928,8 +1022,12 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
             </select>
           </div>
           <div>
-            <label>Due date {revisions.length > 0 && <span style={{ color: 'var(--purple)' }}>(Extended)</span>}</label>
-            <input type="date" value={task.due || ''} onChange={handleDueChange} />
+            <label>Start date</label>
+            <input type="date" value={task.startDate || ''} onChange={e => onUpdate({ startDate: e.target.value })} />
+          </div>
+          <div>
+            <label>End date {revisions.length > 0 && <span style={{ color: 'var(--purple)' }}>(Extended)</span>}</label>
+            <input type="date" value={task.endDate || ''} onChange={handleEndDateChange} />
           </div>
           <div>
             <label>Risk flag</label>
@@ -966,6 +1064,11 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
           </div>
         </div>
 
+        <div className="modal-field">
+          <label>Focus time</label>
+          <button className="btn btn--amber" onClick={onSetFocusTime}>Set focus time on the calendar</button>
+        </div>
+
         {task.status === 'done' && (
           <div className="modal-field">
             <label>Closing remarks (optional)</label>
@@ -994,7 +1097,7 @@ function categoryStatus(tasks, categoryId){
   const catTasks = tasks.filter(t => t.theme === categoryId);
   const open = catTasks.filter(t => t.status !== 'done');
   const today = todayISO();
-  if (open.some(t => t.atRisk || (t.due && t.due < today && !(t.dueRevisions && t.dueRevisions.length)))) return { label: 'CRITICAL', color: 'var(--red)' };
+  if (open.some(t => t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length)))) return { label: 'CRITICAL', color: 'var(--red)' };
   if (open.some(t => t.status === 'progress')) return { label: 'ACTIVE', color: 'var(--cyan)' };
   if (open.length > 0) return { label: 'PENDING', color: 'var(--amber)' };
   if (catTasks.length > 0) return { label: 'CLEAR', color: 'var(--green)' };
@@ -1109,6 +1212,7 @@ function App(){
   const [saved, setSaved] = useState(false);
   const [activeTab, setActiveTab] = useState('overview');
   const [detailTaskId, setDetailTaskId] = useState(null);
+  const [focusTaskId, setFocusTaskId] = useState(null);
 
   // Load once on mount
   useEffect(() => {
@@ -1177,8 +1281,8 @@ function App(){
   }
 
   /* ---------- Task actions ---------- */
-  function addTask(categoryId, title, due){
-    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, due: due || '', notes: '', link: '', closingRemark: '' }]);
+  function addTask(categoryId, title, startDate, endDate){
+    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: startDate || '', endDate: endDate || '', notes: '', link: '', closingRemark: '' }]);
   }
   function updateTask(id, patch){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, ...patch } : t)));
@@ -1189,26 +1293,21 @@ function App(){
   function setTaskStatus(id, status){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, status, atRisk: status === 'done' ? false : t.atRisk } : t)));
   }
-  function cycleTaskStatus(id){
-    setTasks(ts => ts.map(t => {
-      if (t.id !== id) return t;
-      const order = ['todo', 'progress', 'done'];
-      const status = order[(order.indexOf(t.status) + 1) % order.length];
-      return { ...t, status, atRisk: status === 'done' ? false : t.atRisk };
-    }));
-  }
   function toggleRisk(id){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, atRisk: !t.atRisk } : t)));
   }
   function reviseDueDate(id, newDue){
     setTasks(ts => ts.map(t => {
       if (t.id !== id) return t;
-      if (t.due && newDue && newDue !== t.due) {
-        const revisions = [...(t.dueRevisions || []), { from: t.due, to: newDue, remark: '', at: new Date().toISOString() }];
-        return { ...t, due: newDue, dueRevisions: revisions };
+      if (t.endDate && newDue && newDue !== t.endDate) {
+        const revisions = [...(t.dueRevisions || []), { from: t.endDate, to: newDue, remark: '', at: new Date().toISOString() }];
+        return { ...t, endDate: newDue, dueRevisions: revisions };
       }
-      return { ...t, due: newDue };
+      return { ...t, endDate: newDue };
     }));
+  }
+  function addFocusBlock(taskId, taskTitle, date, time){
+    setPlannedMeetings(pm => [...pm, { id: uid(), title: `Focus: ${taskTitle}`, date, time, agenda: [], notes: '', kind: 'focus', taskId }]);
   }
   function goToTask(id){
     setActiveTab('tasks');
@@ -1253,10 +1352,10 @@ function App(){
     const m = pendingMeetings.find(p => p.id === id);
     if (!m) return;
     setPendingMeetings(ps => ps.filter(p => p.id !== id));
-    setPlannedMeetings(pm => [...pm, { id: uid(), title: m.title, date: m.targetDate || todayISO(), time: '10:00', agenda: [], notes: m.notes || '' }]);
+    setPlannedMeetings(pm => [...pm, { id: uid(), title: m.title, date: m.targetDate || todayISO(), time: '10:00', agenda: [], notes: m.notes || '', kind: 'meeting' }]);
   }
   function addPlannedMeeting(title, date, time){
-    setPlannedMeetings(pm => [...pm, { id: uid(), title, date, time, agenda: [], notes: '' }]);
+    setPlannedMeetings(pm => [...pm, { id: uid(), title, date, time, agenda: [], notes: '', kind: 'meeting' }]);
   }
   function updatePlannedMeeting(id, patch){
     setPlannedMeetings(pm => pm.map(p => (p.id === id ? { ...p, ...patch } : p)));
@@ -1272,13 +1371,13 @@ function App(){
   const todayIdx = (new Date().getDay() + 6) % 7;
   const meetingsToday = meetings.filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity)).length
     + plannedMeetings.filter(m => m.date === today).length;
-  const tasksDueToday = tasks.filter(t => t.due === today && t.status !== 'done').length;
-  const atRiskCount = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.due && t.due < today && !(t.dueRevisions && t.dueRevisions.length)))).length;
+  const tasksDueToday = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today)).length;
+  const atRiskCount = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length)))).length;
   const doneCount = tasks.filter(t => t.status === 'done').length;
 
   const upcomingDeadlines = tasks
-    .filter(t => t.status !== 'done' && t.due)
-    .map(t => ({ t, diff: Math.round((new Date(t.due) - new Date(today)) / 86400000) }))
+    .filter(t => t.status !== 'done' && t.endDate)
+    .map(t => ({ t, diff: Math.round((new Date(t.endDate) - new Date(today)) / 86400000) }))
     .filter(x => x.diff <= 3)
     .sort((a, b) => a.diff - b.diff)
     .map(x => x.t);
@@ -1325,23 +1424,29 @@ function App(){
               </div>
               <div className="deadlines-strip">
                 {upcomingDeadlines.map(t => (
-                  <DeadlineChip key={t.id} task={t} category={categoryById(categories, t.theme)} onClick={() => goToTask(t.id)} />
+                  <DeadlineChip key={t.id} task={t} category={categoryById(categories, t.theme)}
+                    onClick={() => goToTask(t.id)}
+                    onFocusClick={() => setFocusTaskId(t.id)} />
                 ))}
               </div>
             </section>
           )}
 
-          <TodaysDues
-            meetings={meetings}
-            plannedMeetings={plannedMeetings}
-            pendingMeetings={pendingMeetings}
-            tasks={tasks}
-            categories={categories}
-            todayIdx={todayIdx}
-            realParity={realParity}
-            onClickMeeting={() => setActiveTab('calendar')}
-            onClickTask={goToTask}
-          />
+          <div className="overview-cards">
+            <TodayMeetingsCard
+              meetings={meetings}
+              plannedMeetings={plannedMeetings}
+              pendingMeetings={pendingMeetings}
+              todayIdx={todayIdx}
+              realParity={realParity}
+              onClickMeeting={() => setActiveTab('calendar')}
+            />
+            <TodayTasksCard
+              tasks={tasks}
+              categories={categories}
+              onClickTask={goToTask}
+            />
+          </div>
         </React.Fragment>
       )}
 
@@ -1355,19 +1460,19 @@ function App(){
             onPromote={promotePendingMeeting}
           />
           <PlannedMeetingsPanel
-            items={plannedMeetings}
+            items={plannedMeetings.filter(m => m.kind !== 'focus')}
             onAdd={addPlannedMeeting}
             onUpdate={updatePlannedMeeting}
             onDelete={deletePlannedMeeting}
           />
           <ScheduleBoard
             meetings={meetings}
-            tasks={tasks}
-            categories={categories}
+            pendingMeetings={pendingMeetings}
+            plannedMeetings={plannedMeetings}
             weekOffset={weekOffset}
             setWeekOffset={setWeekOffset}
             onDeleteMeeting={deleteMeeting}
-            onCycleTask={cycleTaskStatus}
+            onDeletePlanned={deletePlannedMeeting}
             addOpen={addMeetingOpen}
             setAddOpen={setAddMeetingOpen}
             onAddMeeting={addMeeting}
@@ -1420,6 +1525,19 @@ function App(){
           onUpdate={patch => updateTask(detailTaskId, patch)}
           onDelete={() => deleteTask(detailTaskId)}
           onReviseDue={date => reviseDueDate(detailTaskId, date)}
+          onSetFocusTime={() => setFocusTaskId(detailTaskId)}
+        />
+      )}
+
+      {focusTaskId && (
+        <FocusTimeModal
+          task={tasks.find(t => t.id === focusTaskId)}
+          onClose={() => setFocusTaskId(null)}
+          onSave={(date, time) => {
+            const t = tasks.find(x => x.id === focusTaskId);
+            if (t) addFocusBlock(focusTaskId, t.title, date, time);
+            setFocusTaskId(null);
+          }}
         />
       )}
 
