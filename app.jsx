@@ -38,6 +38,51 @@ const TABS = [
   { id: 'quicklinks', label: 'Quick Links' }
 ];
 
+const TASK_FILTERS = [
+  { id: 'today', label: 'Today' },
+  { id: 'week',  label: 'This Week' },
+  { id: 'month', label: 'This Month' },
+  { id: 'all',   label: 'All' }
+];
+
+const STATUS_ORDER = ['todo', 'progress', 'done'];
+const STATUS_META = {
+  todo:     { label: 'To Do',       color: 'var(--text-lo)' },
+  progress: { label: 'In Progress', color: 'var(--cyan)' },
+  done:     { label: 'Done',        color: 'var(--green)' }
+};
+
+function matchesTaskFilter(task, filter, today, weekStart, weekEnd, monthStart, monthEnd){
+  if (filter === 'all') return true;
+  if (!task.due) return false;
+  if (filter === 'today') return task.due === today;
+  if (filter === 'week') return task.due >= weekStart && task.due <= weekEnd;
+  if (filter === 'month') return task.due >= monthStart && task.due <= monthEnd;
+  return true;
+}
+
+const DEFAULT_LINK_TAGS = ['Quick Access', 'Archives', 'Masters'];
+
+const DOC_TYPE_ORDER = ['doc', 'sheet', 'slide', 'drive', 'pdf', 'other'];
+const DOC_TYPE_META = {
+  doc:   { label: 'Docs',          icon: '📄' },
+  sheet: { label: 'Sheets',        icon: '📊' },
+  slide: { label: 'Slides',        icon: '📽' },
+  drive: { label: 'Drive folders', icon: '🗂' },
+  pdf:   { label: 'PDFs',          icon: '📕' },
+  other: { label: 'Other links',   icon: '🔗' }
+};
+
+function detectDocType(url){
+  const u = (url || '').toLowerCase();
+  if (u.includes('docs.google.com/document')) return 'doc';
+  if (u.includes('docs.google.com/spreadsheets') || u.includes('sheets.google.com')) return 'sheet';
+  if (u.includes('docs.google.com/presentation') || u.includes('slides.google.com')) return 'slide';
+  if (u.includes('drive.google.com')) return 'drive';
+  if (u.endsWith('.pdf') || u.includes('.pdf?') || u.includes('.pdf#')) return 'pdf';
+  return 'other';
+}
+
 /* ============================== Helpers ============================== */
 
 function uid(){
@@ -73,6 +118,29 @@ function categoryById(categories, id){
   return categories.find(c => c.id === id);
 }
 
+// Once a task's deadline has been consciously revised, we show "Extended" instead of
+// treating it as overdue/delayed — the person made a deliberate call, it isn't slipping
+// silently. If it's never been revised, fall back to the normal due-soon/overdue read.
+function dueStatusInfo(task, today){
+  if (!task.due || task.status === 'done') return null;
+  const extended = task.dueRevisions && task.dueRevisions.length > 0;
+  if (extended) return { label: 'Extended', color: 'var(--purple)', cssClass: 'extended' };
+  const daysDiff = Math.round((new Date(task.due) - new Date(today)) / 86400000);
+  if (daysDiff < 0) return { label: `Overdue ${Math.abs(daysDiff)}d`, color: 'var(--red)', cssClass: 'overdue' };
+  if (daysDiff === 0) return { label: 'Due today', color: 'var(--red)', cssClass: 'due-soon' };
+  if (daysDiff === 1) return { label: 'Due tomorrow', color: 'var(--amber)', cssClass: 'due-soon' };
+  if (daysDiff <= 3) return { label: `Due in ${daysDiff}d`, color: 'var(--amber)', cssClass: 'due-soon' };
+  return null;
+}
+
+// "Meetings to be set up" reminder rule: 48hrs (2 days) before the target date if one's
+// set, or every day if no target date has been picked yet.
+function needsReminder(pending, today){
+  if (!pending.targetDate) return true;
+  const daysUntil = Math.round((new Date(pending.targetDate) - new Date(today)) / 86400000);
+  return daysUntil <= 2;
+}
+
 function getSeedData(){
   return {
     categories: DEFAULT_CATEGORIES,
@@ -91,8 +159,18 @@ function getSeedData(){
       { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  due: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '' }
     ],
     quickLinks: [
-      { id: uid(), label: 'PRD Master Folder',   url: 'https://drive.google.com' },
-      { id: uid(), label: 'Sprint Tracker Sheet', url: 'https://sheets.google.com' }
+      { id: uid(), label: 'PRD Master Folder',    url: 'https://drive.google.com',  type: 'drive', tag: 'Masters' },
+      { id: uid(), label: 'Sprint Tracker Sheet', url: 'https://sheets.google.com', type: 'sheet', tag: 'Quick Access' }
+    ],
+    linkTags: DEFAULT_LINK_TAGS,
+    pendingMeetings: [
+      { id: uid(), title: 'Vendor kickoff — need to align with procurement first', targetDate: '', notes: '' }
+    ],
+    plannedMeetings: [
+      { id: uid(), title: 'Design review with core team', date: todayISO(), time: '14:00', agenda: [
+        { id: uid(), text: 'Walk through updated onboarding flow', done: false },
+        { id: uid(), text: 'Confirm scope for next sprint', done: false }
+      ], notes: '' }
     ]
   };
 }
@@ -110,27 +188,26 @@ function StatChip({ label, value, tone, onClick }){
 
 function DeadlineChip({ task, category, onClick }){
   const today = todayISO();
-  const diff = Math.round((new Date(task.due) - new Date(today)) / 86400000);
-  let when, color;
-  if (diff < 0) { when = `Overdue ${Math.abs(diff)}d`; color = 'var(--red)'; }
-  else if (diff === 0) { when = 'Due today'; color = 'var(--red)'; }
-  else if (diff === 1) { when = 'Due tomorrow'; color = 'var(--amber)'; }
-  else { when = `Due in ${diff}d`; color = 'var(--amber)'; }
+  const status = dueStatusInfo(task, today) || { label: 'Due', color: 'var(--amber)' };
   return (
-    <div className="deadline-chip" style={{ '--dchip-color': color }} onClick={onClick} role="button" tabIndex={0}>
+    <div className="deadline-chip" style={{ '--dchip-color': status.color }} onClick={onClick} role="button" tabIndex={0}>
       <span className="deadline-chip__code">{category ? category.code : '—'}</span>
       <span className="deadline-chip__title">{task.title}</span>
-      <span className="deadline-chip__when">{when}</span>
+      <span className="deadline-chip__when">{status.label}</span>
     </div>
   );
 }
 
-function TodaysDues({ meetings, tasks, categories, todayIdx, realParity, onClickMeeting, onClickTask }){
+function TodaysDues({ meetings, plannedMeetings, pendingMeetings, tasks, categories, todayIdx, realParity, onClickMeeting, onClickTask }){
   const today = todayISO();
   const todayMeetings = meetings
     .filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity))
     .sort((a, b) => a.time.localeCompare(b.time));
+  const todayPlanned = plannedMeetings.filter(m => m.date === today).sort((a, b) => a.time.localeCompare(b.time));
+  const todayReminders = pendingMeetings.filter(m => needsReminder(m, today));
   const todayTasks = tasks.filter(t => t.due === today && t.status !== 'done');
+
+  const nothing = todayMeetings.length === 0 && todayPlanned.length === 0 && todayReminders.length === 0 && todayTasks.length === 0;
 
   return (
     <section className="panel">
@@ -140,7 +217,7 @@ function TodaysDues({ meetings, tasks, categories, todayIdx, realParity, onClick
           <h2 className="panel__title">{WEEKDAY_LABELS[todayIdx]}'s syncs &amp; dues</h2>
         </div>
       </div>
-      {todayMeetings.length === 0 && todayTasks.length === 0 ? (
+      {nothing ? (
         <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>Nothing scheduled or due today. Clear runway.</p>
       ) : (
         <div className="today-list">
@@ -154,6 +231,20 @@ function TodaysDues({ meetings, tasks, categories, todayIdx, realParity, onClick
               </div>
             );
           })}
+          {todayPlanned.map(m => (
+            <div key={m.id} className="today-item" style={{ '--type-color': 'var(--purple)' }} onClick={onClickMeeting}>
+              <span className="today-item__time">{m.time}</span>
+              <span className="today-item__title">{m.title}</span>
+              <span className="pill" style={{ '--pill-color': 'var(--purple)', '--pill-bg': 'var(--purple-dim)' }}>Meeting</span>
+            </div>
+          ))}
+          {todayReminders.map(m => (
+            <div key={m.id} className="today-item" style={{ '--type-color': 'var(--red)' }} onClick={onClickMeeting}>
+              <span className="today-item__time" style={{ color: 'var(--red)' }}>&#128276;</span>
+              <span className="today-item__title">{m.title}</span>
+              <span className="pill" style={{ '--pill-color': 'var(--red)', '--pill-bg': 'var(--red-dim)' }}>Set up</span>
+            </div>
+          ))}
           {todayTasks.map(t => {
             const cat = categoryById(categories, t.theme);
             return (
@@ -357,16 +448,209 @@ function CalendarPanel({ url, onSave, onHide }){
   );
 }
 
-function QuickLinksPanel({ links, onAdd, onDelete }){
+function PendingMeetingsPanel({ items, onAdd, onUpdate, onDelete, onPromote }){
+  const [open, setOpen] = useState(false);
+  const [title, setTitle] = useState('');
+  const [targetDate, setTargetDate] = useState('');
+  const [notes, setNotes] = useState('');
+  const today = todayISO();
+
+  function submit(){
+    if (!title.trim()) return;
+    onAdd(title.trim(), targetDate, notes.trim());
+    setTitle(''); setTargetDate(''); setNotes(''); setOpen(false);
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel__head">
+        <div>
+          <p className="panel__eyebrow">Meeting Invites</p>
+          <h2 className="panel__title">Meetings To Be Set Up</h2>
+        </div>
+        <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>+ Add</button>
+      </div>
+
+      <div className={`add-form${open ? ' open' : ''}`}>
+        <div>
+          <label>Meeting</label>
+          <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Design review with legal" />
+        </div>
+        <div>
+          <label>Target date (optional)</label>
+          <input type="date" value={targetDate} onChange={e => setTargetDate(e.target.value)} />
+        </div>
+        <div style={{ gridColumn: '1/-1' }}>
+          <label>Notes (optional)</label>
+          <input type="text" value={notes} onChange={e => setNotes(e.target.value)} placeholder="Who needs to be involved, context, etc." />
+        </div>
+        <div className="full">
+          <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
+          <button className="btn btn--amber" onClick={submit}>Add</button>
+        </div>
+      </div>
+
+      {items.length === 0 ? (
+        <p className="task-empty">Nothing pending — add a meeting you still need to set up. No target date means you'll see a daily reminder until it's scheduled.</p>
+      ) : (
+        <div className="pending-meeting-list">
+          {items.map(m => {
+            const remind = needsReminder(m, today);
+            return (
+              <div key={m.id} className="pending-meeting-row">
+                <span className={`reminder-dot${remind ? ' due' : ''}`} title={remind ? 'Reminder: this still needs setting up' : 'No reminder due yet'} />
+                <input className="task-title" type="text" value={m.title} onChange={e => onUpdate(m.id, { title: e.target.value })} />
+                <input className="task-due" type="date" value={m.targetDate || ''} title="Target date (optional)"
+                  onChange={e => onUpdate(m.id, { targetDate: e.target.value })} />
+                <input className="task-notes-inline" type="text" placeholder="Notes" value={m.notes || ''}
+                  onChange={e => onUpdate(m.id, { notes: e.target.value })} />
+                <button className="btn btn--amber" onClick={() => onPromote(m.id)}>Schedule</button>
+                <button className="icon-btn" title="Delete" onClick={() => onDelete(m.id)}>&times;</button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AgendaList({ agenda, onChange }){
+  const [text, setText] = useState('');
+  const items = agenda || [];
+
+  function addItem(){
+    if (!text.trim()) return;
+    onChange([...items, { id: uid(), text: text.trim(), done: false }]);
+    setText('');
+  }
+  function toggleItem(id){
+    onChange(items.map(a => (a.id === id ? { ...a, done: !a.done } : a)));
+  }
+  function deleteItem(id){
+    onChange(items.filter(a => a.id !== id));
+  }
+
+  return (
+    <div className="agenda-list">
+      {items.map(a => (
+        <div key={a.id} className={`agenda-item${a.done ? ' done' : ''}`}>
+          <input type="checkbox" checked={a.done} onChange={() => toggleItem(a.id)} />
+          <span className="agenda-item__text">{a.text}</span>
+          <button className="icon-btn" title="Remove" onClick={() => deleteItem(a.id)}>&times;</button>
+        </div>
+      ))}
+      <div className="agenda-add">
+        <input type="text" placeholder="Add agenda point / action item…" value={text}
+          onChange={e => setText(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') addItem(); }} />
+        <button className="btn" onClick={addItem}>Add</button>
+      </div>
+    </div>
+  );
+}
+
+function PlannedMeetingCard({ meeting, onUpdate, onDelete }){
+  return (
+    <div className="planned-meeting-card">
+      <div className="planned-meeting-card__head">
+        <input className="task-title" type="text" value={meeting.title} onChange={e => onUpdate({ title: e.target.value })} />
+        <input type="date" value={meeting.date || ''} title="Reschedule" onChange={e => onUpdate({ date: e.target.value })} />
+        <input type="time" value={meeting.time || ''} onChange={e => onUpdate({ time: e.target.value })} />
+        <button className="icon-btn" title="Delete meeting" onClick={onDelete}>&times;</button>
+      </div>
+      <AgendaList agenda={meeting.agenda} onChange={agenda => onUpdate({ agenda })} />
+    </div>
+  );
+}
+
+function PlannedMeetingsPanel({ items, onAdd, onUpdate, onDelete }){
+  const [open, setOpen] = useState(false);
+  const [title, setTitle] = useState('');
+  const [date, setDate] = useState('');
+  const [time, setTime] = useState('10:00');
+
+  function submit(){
+    if (!title.trim() || !date) return;
+    onAdd(title.trim(), date, time);
+    setTitle(''); setDate(''); setOpen(false);
+  }
+
+  const sorted = [...items].sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+
+  return (
+    <section className="panel">
+      <div className="panel__head">
+        <div>
+          <p className="panel__eyebrow">Meeting Invites</p>
+          <h2 className="panel__title">Meetings Scheduled</h2>
+        </div>
+        <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>+ Add</button>
+      </div>
+
+      <div className={`add-form${open ? ' open' : ''}`}>
+        <div>
+          <label>Meeting</label>
+          <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Vendor kickoff call" />
+        </div>
+        <div>
+          <label>Date</label>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} />
+        </div>
+        <div>
+          <label>Time</label>
+          <input type="time" value={time} onChange={e => setTime(e.target.value)} />
+        </div>
+        <div className="full">
+          <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
+          <button className="btn btn--amber" onClick={submit}>Add</button>
+        </div>
+      </div>
+
+      {sorted.length === 0 ? (
+        <p className="task-empty">No meetings scheduled yet.</p>
+      ) : (
+        <div className="planned-meetings">
+          {sorted.map(m => (
+            <PlannedMeetingCard key={m.id} meeting={m}
+              onUpdate={patch => onUpdate(m.id, patch)}
+              onDelete={() => onDelete(m.id)} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+
+function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteTag }){
   const [open, setOpen] = useState(false);
   const [label, setLabel] = useState('');
   const [url, setUrl] = useState('');
+  const [type, setType] = useState('auto');
+  const [tag, setTag] = useState(linkTags[0] || '');
+  const [manageOpen, setManageOpen] = useState(false);
+  const [newTagName, setNewTagName] = useState('');
+  const [activeTagFilter, setActiveTagFilter] = useState('all');
+
+  useEffect(() => {
+    if (!linkTags.includes(tag) && linkTags.length) setTag(linkTags[0]);
+  }, [linkTags, tag]);
 
   function submit(){
     if (!label.trim() || !url.trim()) return;
-    onAdd(label.trim(), url.trim());
-    setLabel(''); setUrl(''); setOpen(false);
+    const finalType = type === 'auto' ? detectDocType(url) : type;
+    onAdd(label.trim(), url.trim(), finalType, tag || linkTags[0] || 'Quick Access');
+    setLabel(''); setUrl(''); setType('auto'); setOpen(false);
   }
+
+  function submitTag(){
+    if (!newTagName.trim()) return;
+    onAddTag(newTagName.trim());
+    setNewTagName('');
+  }
+
+  const filtered = activeTagFilter === 'all' ? links : links.filter(l => (l.tag || 'Quick Access') === activeTagFilter);
 
   return (
     <section className="panel">
@@ -375,8 +659,12 @@ function QuickLinksPanel({ links, onAdd, onDelete }){
           <p className="panel__eyebrow">External Feed</p>
           <h2 className="panel__title">Quick Links · Docs &amp; Sheets</h2>
         </div>
-        <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>+ Add link</button>
+        <div className="week-nav">
+          <button className="btn" onClick={() => setManageOpen(o => !o)}>Manage tags</button>
+          <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>+ Add link</button>
+        </div>
       </div>
+
       <div className={`add-form${open ? ' open' : ''}`}>
         <div>
           <label>Label</label>
@@ -386,21 +674,81 @@ function QuickLinksPanel({ links, onAdd, onDelete }){
           <label>Google Doc / Sheet URL</label>
           <input type="url" value={url} onChange={e => setUrl(e.target.value)} placeholder="https://docs.google.com/..." />
         </div>
+        <div>
+          <label>Type</label>
+          <select value={type} onChange={e => setType(e.target.value)}>
+            <option value="auto">Auto-detect</option>
+            {DOC_TYPE_ORDER.map(k => <option key={k} value={k}>{DOC_TYPE_META[k].label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label>Tag</label>
+          <select value={tag} onChange={e => setTag(e.target.value)}>
+            {linkTags.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
         <div className="full">
           <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
           <button className="btn btn--amber" onClick={submit}>Add link</button>
         </div>
       </div>
-      <div className="quick-links">
-        {links.length === 0 ? (
-          <div className="quick-links-empty">No quick links yet — add your PRD folder, sprint sheet, or any doc you open often.</div>
-        ) : links.map(l => (
-          <div key={l.id} className="quick-link-chip">
-            <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
-            <button title="Remove" onClick={() => onDelete(l.id)}>&times;</button>
+
+      <div className={`add-form${manageOpen ? ' open' : ''}`}>
+        <div className="full" style={{ display: 'block', marginBottom: 4 }}>
+          <label>New tag</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input type="text" placeholder="e.g. Quick Access" value={newTagName}
+              onChange={e => setNewTagName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') submitTag(); }} />
+            <button className="btn btn--amber" onClick={submitTag}>Create</button>
           </div>
+        </div>
+        <div className="full" style={{ display: 'block' }}>
+          <div className="category-manage-list">
+            {linkTags.map(t => {
+              const count = links.filter(l => (l.tag || 'Quick Access') === t).length;
+              return (
+                <div key={t} className="category-chip">
+                  <span className="category-chip__title">{t}</span>
+                  <span className="category-chip__count">{count}</span>
+                  <button className="icon-btn" disabled={count > 0}
+                    title={count > 0 ? 'Retag its links first' : 'Delete tag'}
+                    onClick={() => onDeleteTag(t)}>&times;</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="task-filter-tabs" style={{ marginTop: 14 }}>
+        <button className={`filter-btn${activeTagFilter === 'all' ? ' active' : ''}`} onClick={() => setActiveTagFilter('all')}>All</button>
+        {linkTags.map(t => (
+          <button key={t} className={`filter-btn${activeTagFilter === t ? ' active' : ''}`} onClick={() => setActiveTagFilter(t)}>{t}</button>
         ))}
       </div>
+
+      {filtered.length === 0 ? (
+        <p className="quick-links-empty" style={{ marginTop: 12 }}>No links here yet — add your PRD folder, sprint sheet, or any doc you open often.</p>
+      ) : DOC_TYPE_ORDER.map(typeKey => {
+        const typeLinks = filtered.filter(l => (l.type || detectDocType(l.url)) === typeKey);
+        if (typeLinks.length === 0) return null;
+        const meta = DOC_TYPE_META[typeKey];
+        return (
+          <div key={typeKey} className="category-subgroup" style={{ marginTop: 14 }}>
+            <p className="category-subgroup__label">{meta.icon} {meta.label}</p>
+            <div className="quick-links">
+              {typeLinks.map(l => (
+                <div key={l.id} className="quick-link-chip">
+                  <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
+                  {l.tag && <span className="quick-link-chip__tag">{l.tag}</span>}
+                  <button title="Remove" onClick={() => onDelete(l.id)}>&times;</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
     </section>
   );
 }
@@ -490,27 +838,24 @@ function QuickAddPanel({ categories, tasks, onAddTask, onAddCategory, onDeleteCa
   );
 }
 
-function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail }){
+function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onReviseDue }){
   const today = todayISO();
-  const overdue = task.due && task.due < today && task.status !== 'done';
-  const daysDiff = task.due ? Math.round((new Date(task.due) - new Date(today)) / 86400000) : null;
-  const dueSoon = !overdue && task.status !== 'done' && daysDiff !== null && daysDiff >= 0 && daysDiff <= 3;
-
-  let dueTitle = '';
-  if (task.status !== 'done' && task.due) {
-    if (overdue) dueTitle = `Overdue by ${Math.abs(daysDiff)} day(s)`;
-    else if (daysDiff === 0) dueTitle = 'Due today';
-    else if (daysDiff === 1) dueTitle = 'Due tomorrow';
-    else if (daysDiff <= 3) dueTitle = `Due in ${daysDiff} days`;
-  }
-
-  const dueClass = overdue ? ' overdue' : (dueSoon ? ' due-soon' : '');
+  const dueStatus = dueStatusInfo(task, today);
+  const dueClass = dueStatus ? ` ${dueStatus.cssClass}` : '';
+  const dueTitle = dueStatus ? dueStatus.label : '';
   const hasContent = (task.notes && task.notes.trim()) || (task.closingRemark && task.closingRemark.trim()) || task.link;
 
   function handleStatusChange(e){
     const value = e.target.value;
     onSetStatus(value);
     if (value === 'done') onOpenDetail(); // surface the (optional) closing-remark field right away
+  }
+
+  function handleDueChange(e){
+    const newVal = e.target.value;
+    const isRevision = task.due && newVal && newVal !== task.due;
+    onReviseDue(newVal);
+    if (isRevision) onOpenDetail(); // surface the (optional) revision remark right away
   }
 
   return (
@@ -528,14 +873,14 @@ function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail }){
       <input className={`task-title${task.status === 'done' ? ' is-done' : ''}`} type="text" value={task.title}
         onChange={e => onUpdate({ title: e.target.value })} />
       <input className={`task-due${dueClass}`} type="date" value={task.due || ''} title={dueTitle}
-        onChange={e => onUpdate({ due: e.target.value })} />
+        onChange={handleDueChange} />
       <button className={`icon-btn${task.atRisk ? ' flag-on' : ''}`} title="Flag at risk" onClick={onToggleRisk}>&#9873;</button>
       <button className={`icon-btn${hasContent ? ' link-on' : ''}`} title="Open details & notes" onClick={onOpenDetail}>&#8942;</button>
     </div>
   );
 }
 
-function TaskDetailModal({ task, category, onClose, onUpdate, onDelete }){
+function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onReviseDue }){
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
     document.addEventListener('keydown', onKey);
@@ -543,6 +888,22 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete }){
   }, [onClose]);
 
   if (!task) return null;
+
+  const revisions = task.dueRevisions || [];
+
+  function handleDueChange(e){
+    const newVal = e.target.value;
+    const isRevision = task.due && newVal && newVal !== task.due;
+    onReviseDue(newVal);
+    return isRevision;
+  }
+
+  function updateLastRevisionRemark(value){
+    if (revisions.length === 0) return;
+    const updated = [...revisions];
+    updated[updated.length - 1] = { ...updated[updated.length - 1], remark: value };
+    onUpdate({ dueRevisions: updated });
+  }
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -567,8 +928,8 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete }){
             </select>
           </div>
           <div>
-            <label>Due date</label>
-            <input type="date" value={task.due || ''} onChange={e => onUpdate({ due: e.target.value })} />
+            <label>Due date {revisions.length > 0 && <span style={{ color: 'var(--purple)' }}>(Extended)</span>}</label>
+            <input type="date" value={task.due || ''} onChange={handleDueChange} />
           </div>
           <div>
             <label>Risk flag</label>
@@ -578,6 +939,23 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete }){
             </button>
           </div>
         </div>
+
+        {revisions.length > 0 && (
+          <div className="modal-field">
+            <label>Deadline history</label>
+            <div className="revision-history">
+              {revisions.map((r, i) => (
+                <div key={i} className="revision-history__item">
+                  <span className="revision-history__dates">{r.from} &rarr; {r.to}</span>
+                  {r.remark && <span className="revision-history__remark">{r.remark}</span>}
+                </div>
+              ))}
+            </div>
+            <textarea rows={2} placeholder="Optional remark for the latest extension…"
+              value={revisions[revisions.length - 1].remark || ''}
+              onChange={e => updateLastRevisionRemark(e.target.value)} />
+          </div>
+        )}
 
         <div className="modal-field">
           <label>Linked doc / sheet</label>
@@ -616,44 +994,99 @@ function categoryStatus(tasks, categoryId){
   const catTasks = tasks.filter(t => t.theme === categoryId);
   const open = catTasks.filter(t => t.status !== 'done');
   const today = todayISO();
-  if (open.some(t => t.atRisk || (t.due && t.due < today))) return { label: 'CRITICAL', color: 'var(--red)' };
+  if (open.some(t => t.atRisk || (t.due && t.due < today && !(t.dueRevisions && t.dueRevisions.length)))) return { label: 'CRITICAL', color: 'var(--red)' };
   if (open.some(t => t.status === 'progress')) return { label: 'ACTIVE', color: 'var(--cyan)' };
   if (open.length > 0) return { label: 'PENDING', color: 'var(--amber)' };
   if (catTasks.length > 0) return { label: 'CLEAR', color: 'var(--green)' };
   return { label: 'IDLE', color: 'var(--text-faint)' };
 }
 
-function CategoryCard({ category, tasks, onUpdateTask, onSetTaskStatus, onToggleRisk, onOpenDetail }){
-  const catTasks = tasks.filter(t => t.theme === category.id);
-  const openCount = catTasks.filter(t => t.status !== 'done').length;
-  const st = categoryStatus(tasks, category.id);
+function TaskListView({ tasks, categories, onUpdateTask, onSetTaskStatus, onToggleRisk, onOpenDetail, onReviseDue }){
+  const [filter, setFilter] = useState('all');
+
+  const today = todayISO();
+  const monday = getMonday(new Date());
+  const sunday = new Date(monday); sunday.setDate(sunday.getDate() + 6);
+  const weekStart = isoOf(monday);
+  const weekEnd = isoOf(sunday);
+  const now = new Date();
+  const monthStart = isoOf(new Date(now.getFullYear(), now.getMonth(), 1));
+  const monthEnd = isoOf(new Date(now.getFullYear(), now.getMonth() + 1, 0));
+
+  const filtered = tasks.filter(t => matchesTaskFilter(t, filter, today, weekStart, weekEnd, monthStart, monthEnd));
+
+  function renderTaskRow(t){
+    return (
+      <TaskRow
+        key={t.id}
+        task={t}
+        onUpdate={patch => onUpdateTask(t.id, patch)}
+        onSetStatus={status => onSetTaskStatus(t.id, status)}
+        onToggleRisk={() => onToggleRisk(t.id)}
+        onOpenDetail={() => onOpenDetail(t.id)}
+        onReviseDue={date => onReviseDue(t.id, date)}
+      />
+    );
+  }
 
   return (
-    <div className="theme-card">
-      <div className="theme-card__head">
-        <div className="theme-led" style={{ background: st.color }} />
-        <div className="theme-card__meta">
-          <div className="theme-card__code">{category.code}</div>
-          <div className="theme-card__title">{category.title}</div>
-          <div className="theme-card__status" style={{ color: st.color }}>{st.label}</div>
+    <section className="panel" style={{ background: 'transparent', border: 'none', padding: 0 }}>
+      <div className="panel__head">
+        <div>
+          <p className="panel__eyebrow">Task Console</p>
+          <h2 className="panel__title">Grouped by status, then category</h2>
         </div>
-        <div className="theme-card__count">{openCount} open</div>
       </div>
-      <div className="task-list">
-        {catTasks.length === 0 ? (
-          <div className="task-empty">No tasks yet — add one from Quick Add above and tag it "{category.title}".</div>
-        ) : catTasks.map(t => (
-          <TaskRow
-            key={t.id}
-            task={t}
-            onUpdate={patch => onUpdateTask(t.id, patch)}
-            onSetStatus={status => onSetTaskStatus(t.id, status)}
-            onToggleRisk={() => onToggleRisk(t.id)}
-            onOpenDetail={() => onOpenDetail(t.id)}
-          />
+
+      <div className="task-filter-tabs">
+        {TASK_FILTERS.map(f => (
+          <button key={f.id} className={`filter-btn${filter === f.id ? ' active' : ''}`} onClick={() => setFilter(f.id)}>{f.label}</button>
         ))}
       </div>
-    </div>
+
+      {filtered.length === 0 ? (
+        <p className="task-empty" style={{ padding: '20px 0' }}>No tasks in this view.</p>
+      ) : STATUS_ORDER.map(statusId => {
+        const statusTasks = filtered.filter(t => t.status === statusId);
+        if (statusTasks.length === 0) return null;
+        const meta = STATUS_META[statusId];
+        const orphanTasks = statusTasks.filter(t => !categories.find(c => c.id === t.theme));
+
+        return (
+          <div className="status-group" key={statusId}>
+            <h3 className="status-group__title" style={{ color: meta.color, borderColor: meta.color }}>
+              {meta.label}<span className="status-group__count">{statusTasks.length}</span>
+            </h3>
+
+            {categories.map(cat => {
+              const catTasks = statusTasks.filter(t => t.theme === cat.id);
+              if (catTasks.length === 0) return null;
+              const st = categoryStatus(tasks, cat.id);
+              return (
+                <div className="category-subgroup" key={cat.id}>
+                  <p className="category-subgroup__label" style={{ '--cchip-color': cat.chip }}>
+                    <span className="category-subgroup__dot" style={{ background: st.color }} />
+                    {cat.code} · {cat.title}
+                  </p>
+                  <div className="task-list">
+                    {catTasks.map(renderTaskRow)}
+                  </div>
+                </div>
+              );
+            })}
+
+            {orphanTasks.length > 0 && (
+              <div className="category-subgroup">
+                <p className="category-subgroup__label">Uncategorised</p>
+                <div className="task-list">
+                  {orphanTasks.map(renderTaskRow)}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </section>
   );
 }
 
@@ -666,6 +1099,9 @@ function App(){
   const [meetings, setMeetings] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [quickLinks, setQuickLinks] = useState([]);
+  const [linkTags, setLinkTags] = useState(DEFAULT_LINK_TAGS);
+  const [pendingMeetings, setPendingMeetings] = useState([]);
+  const [plannedMeetings, setPlannedMeetings] = useState([]);
   const [settings, setSettings] = useState({ calendarEmbedUrl: '' });
   const [weekOffset, setWeekOffset] = useState(0);
   const [addMeetingOpen, setAddMeetingOpen] = useState(false);
@@ -688,6 +1124,9 @@ function App(){
         setMeetings(parsed.meetings || []);
         setTasks(parsed.tasks || []);
         setQuickLinks(parsed.quickLinks || []);
+        setLinkTags((parsed.linkTags && parsed.linkTags.length) ? parsed.linkTags : DEFAULT_LINK_TAGS);
+        setPendingMeetings(parsed.pendingMeetings || []);
+        setPlannedMeetings(parsed.plannedMeetings || []);
         setSettings(Object.assign({ calendarEmbedUrl: '' }, parsed.settings || {}));
       } else {
         const seed = getSeedData();
@@ -696,6 +1135,9 @@ function App(){
         setMeetings(seed.meetings);
         setTasks(seed.tasks);
         setQuickLinks(seed.quickLinks);
+        setLinkTags(seed.linkTags);
+        setPendingMeetings(seed.pendingMeetings);
+        setPlannedMeetings(seed.plannedMeetings);
       }
     } catch (e) {
       console.error('Failed to load saved data', e);
@@ -707,14 +1149,14 @@ function App(){
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ categories, categoryCounter, meetings, tasks, quickLinks, settings }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings }));
       setSaved(true);
       const t = setTimeout(() => setSaved(false), 900);
       return () => clearTimeout(t);
     } catch (e) {
       console.error('Failed to save data', e);
     }
-  }, [categories, categoryCounter, meetings, tasks, quickLinks, settings, loaded]);
+  }, [categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, loaded]);
 
   // Clock
   useEffect(() => {
@@ -758,6 +1200,16 @@ function App(){
   function toggleRisk(id){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, atRisk: !t.atRisk } : t)));
   }
+  function reviseDueDate(id, newDue){
+    setTasks(ts => ts.map(t => {
+      if (t.id !== id) return t;
+      if (t.due && newDue && newDue !== t.due) {
+        const revisions = [...(t.dueRevisions || []), { from: t.due, to: newDue, remark: '', at: new Date().toISOString() }];
+        return { ...t, due: newDue, dueRevisions: revisions };
+      }
+      return { ...t, due: newDue };
+    }));
+  }
   function goToTask(id){
     setActiveTab('tasks');
     setDetailTaskId(id);
@@ -772,11 +1224,45 @@ function App(){
   }
 
   /* ---------- Quick link actions ---------- */
-  function addQuickLink(label, url){
-    setQuickLinks(qs => [...qs, { id: uid(), label, url }]);
+  function addQuickLink(label, url, type, tag){
+    setQuickLinks(qs => [...qs, { id: uid(), label, url, type, tag }]);
   }
   function deleteQuickLink(id){
     setQuickLinks(qs => qs.filter(q => q.id !== id));
+  }
+  function addLinkTag(name){
+    setLinkTags(ts => (ts.includes(name) ? ts : [...ts, name]));
+  }
+  function deleteLinkTag(name){
+    const inUse = quickLinks.some(l => (l.tag || 'Quick Access') === name);
+    if (inUse) return;
+    setLinkTags(ts => ts.filter(t => t !== name));
+  }
+
+  /* ---------- Meeting-invite actions ---------- */
+  function addPendingMeeting(title, targetDate, notes){
+    setPendingMeetings(ps => [...ps, { id: uid(), title, targetDate: targetDate || '', notes: notes || '' }]);
+  }
+  function updatePendingMeeting(id, patch){
+    setPendingMeetings(ps => ps.map(p => (p.id === id ? { ...p, ...patch } : p)));
+  }
+  function deletePendingMeeting(id){
+    setPendingMeetings(ps => ps.filter(p => p.id !== id));
+  }
+  function promotePendingMeeting(id){
+    const m = pendingMeetings.find(p => p.id === id);
+    if (!m) return;
+    setPendingMeetings(ps => ps.filter(p => p.id !== id));
+    setPlannedMeetings(pm => [...pm, { id: uid(), title: m.title, date: m.targetDate || todayISO(), time: '10:00', agenda: [], notes: m.notes || '' }]);
+  }
+  function addPlannedMeeting(title, date, time){
+    setPlannedMeetings(pm => [...pm, { id: uid(), title, date, time, agenda: [], notes: '' }]);
+  }
+  function updatePlannedMeeting(id, patch){
+    setPlannedMeetings(pm => pm.map(p => (p.id === id ? { ...p, ...patch } : p)));
+  }
+  function deletePlannedMeeting(id){
+    setPlannedMeetings(pm => pm.filter(p => p.id !== id));
   }
 
   /* ---------- Derived stats ---------- */
@@ -784,9 +1270,10 @@ function App(){
   const realMonday = getMonday(new Date());
   const realParity = getParity(realMonday);
   const todayIdx = (new Date().getDay() + 6) % 7;
-  const meetingsToday = meetings.filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity)).length;
+  const meetingsToday = meetings.filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity)).length
+    + plannedMeetings.filter(m => m.date === today).length;
   const tasksDueToday = tasks.filter(t => t.due === today && t.status !== 'done').length;
-  const atRiskCount = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.due && t.due < today))).length;
+  const atRiskCount = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.due && t.due < today && !(t.dueRevisions && t.dueRevisions.length)))).length;
   const doneCount = tasks.filter(t => t.status === 'done').length;
 
   const upcomingDeadlines = tasks
@@ -846,6 +1333,8 @@ function App(){
 
           <TodaysDues
             meetings={meetings}
+            plannedMeetings={plannedMeetings}
+            pendingMeetings={pendingMeetings}
             tasks={tasks}
             categories={categories}
             todayIdx={todayIdx}
@@ -858,6 +1347,19 @@ function App(){
 
       {activeTab === 'calendar' && (
         <React.Fragment>
+          <PendingMeetingsPanel
+            items={pendingMeetings}
+            onAdd={addPendingMeeting}
+            onUpdate={updatePendingMeeting}
+            onDelete={deletePendingMeeting}
+            onPromote={promotePendingMeeting}
+          />
+          <PlannedMeetingsPanel
+            items={plannedMeetings}
+            onAdd={addPlannedMeeting}
+            onUpdate={updatePlannedMeeting}
+            onDelete={deletePlannedMeeting}
+          />
           <ScheduleBoard
             meetings={meetings}
             tasks={tasks}
@@ -887,32 +1389,27 @@ function App(){
             onAddCategory={addCategory}
             onDeleteCategory={deleteCategory}
           />
-          <section className="panel" style={{ background: 'transparent', border: 'none', padding: 0 }}>
-            <div className="panel__head">
-              <div>
-                <p className="panel__eyebrow">Task Console</p>
-                <h2 className="panel__title">Segregated by category</h2>
-              </div>
-            </div>
-            <div className="task-console">
-              {categories.map(cat => (
-                <CategoryCard
-                  key={cat.id}
-                  category={cat}
-                  tasks={tasks}
-                  onUpdateTask={updateTask}
-                  onSetTaskStatus={setTaskStatus}
-                  onToggleRisk={toggleRisk}
-                  onOpenDetail={setDetailTaskId}
-                />
-              ))}
-            </div>
-          </section>
+          <TaskListView
+            tasks={tasks}
+            categories={categories}
+            onUpdateTask={updateTask}
+            onSetTaskStatus={setTaskStatus}
+            onToggleRisk={toggleRisk}
+            onOpenDetail={setDetailTaskId}
+            onReviseDue={reviseDueDate}
+          />
         </React.Fragment>
       )}
 
       {activeTab === 'quicklinks' && (
-        <QuickLinksPanel links={quickLinks} onAdd={addQuickLink} onDelete={deleteQuickLink} />
+        <QuickLinksPanel
+          links={quickLinks}
+          linkTags={linkTags}
+          onAdd={addQuickLink}
+          onDelete={deleteQuickLink}
+          onAddTag={addLinkTag}
+          onDeleteTag={deleteLinkTag}
+        />
       )}
 
       {detailTaskId && (
@@ -922,6 +1419,7 @@ function App(){
           onClose={() => setDetailTaskId(null)}
           onUpdate={patch => updateTask(detailTaskId, patch)}
           onDelete={() => deleteTask(detailTaskId)}
+          onReviseDue={date => reviseDueDate(detailTaskId, date)}
         />
       )}
 
