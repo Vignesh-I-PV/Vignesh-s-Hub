@@ -16,7 +16,29 @@
 <body>
 <div id="root"></div>
 
-<!-- Babel transforms this file's JSX in the browser at load time -->
-<script type="text/babel" data-presets="react" src="app.jsx"></script>
+<!--
+  We transform app.jsx manually (instead of using <script type="text/babel" src="...">)
+  so we can force the "classic" JSX runtime. Newer Babel defaults to the "automatic"
+  runtime, which compiles JSX into `import {jsx} from "react/jsx-runtime"` — real ES
+  module syntax that a plain <script> tag can't execute. Classic runtime compiles JSX
+  into React.createElement(...) calls instead, which works with the plain UMD React
+  build loaded above.
+-->
+<script>
+  fetch('app.jsx')
+    .then(res => res.text())
+    .then(code => {
+      const output = Babel.transform(code, {
+        presets: [['react', { runtime: 'classic' }]]
+      }).code;
+      const script = document.createElement('script');
+      script.text = output;
+      document.body.appendChild(script);
+    })
+    .catch(err => {
+      document.getElementById('root').innerHTML =
+        '<p style="color:#EB5A5A; font-family:monospace; padding:20px;">Failed to load app.jsx: ' + err.message + '</p>';
+    });
+</script>
 </body>
 </html>
