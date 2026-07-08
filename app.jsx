@@ -1,4 +1,16 @@
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
+
+// Supabase client — reads your project URL/key from config.js. If that file
+// still has placeholder values, calls will fail and we show a setup notice
+// instead of a broken login screen.
+let supabaseClient = null;
+try {
+  if (window.SUPABASE_CONFIG && window.supabase) {
+    supabaseClient = window.supabase.createClient(window.SUPABASE_CONFIG.url, window.SUPABASE_CONFIG.anonKey);
+  }
+} catch (e) {
+  console.error('Supabase client failed to initialize', e);
+}
 
 /* ============================== Constants ============================== */
 
@@ -30,7 +42,6 @@ const MEETING_TYPES = {
 
 const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const STORAGE_KEY = 'control-centre-state';
 const TABS = [
   { id: 'overview',   label: 'Overview' },
   { id: 'calendar',   label: 'Calendar' },
@@ -202,14 +213,128 @@ function getWorkingHours(workingHours, defaultWorkingHours, dateISO){
   return (workingHours && workingHours[dateISO]) || defaultWorkingHours || { start: '09:00', end: '18:00' };
 }
 
+// A task's effective completion: explicit "done" always wins; otherwise, if it has
+// sub-tasks, its progress rolls up from how many of those are checked off.
+function taskCompletionFraction(task){
+  if (task.status === 'done') return 1;
+  const subs = task.subtasks || [];
+  if (subs.length > 0) return subs.filter(s => s.done).length / subs.length;
+  return 0;
+}
+
 // Weighted completion for whichever tasks pass `filterFn` — the same shape powers both
 // the daily and weekly progress bars, just with a different scope of tasks passed in.
 function computeProgress(tasks, filterFn){
   const relevant = tasks.filter(filterFn);
   const totalWeight = relevant.reduce((sum, t) => sum + (t.weight || 1), 0);
-  const doneWeight = relevant.filter(t => t.status === 'done').reduce((sum, t) => sum + (t.weight || 1), 0);
+  const doneWeight = relevant.reduce((sum, t) => sum + (t.weight || 1) * taskCompletionFraction(t), 0);
   const percent = totalWeight > 0 ? Math.round((doneWeight / totalWeight) * 100) : null;
   return { percent, totalWeight, doneWeight, count: relevant.length };
+}
+
+// A sub-task can never start before, or end after, its parent task's own dates —
+// it can only be a tighter window within the parent's timeline.
+function clampSubtaskDates(task, startDate, endDate){
+  let s = startDate || '';
+  let e = endDate || '';
+  if (task.startDate && s && s < task.startDate) s = task.startDate;
+  if (task.endDate && e && e > task.endDate) e = task.endDate;
+  return { startDate: s, endDate: e };
+}
+
+/* ---------- Meeting completion / in-progress status ---------- */
+function getMeetingStatus(dateISO, time, duration){
+  const today = todayISO();
+  if (dateISO < today) return { status: 'done', pct: 100 };
+  if (dateISO > today) return { status: 'upcoming', pct: 0 };
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const startMin = minutesSinceMidnight(time);
+  const dur = duration || 30;
+  const pct = ((nowMin - startMin) / dur) * 100;
+  if (pct >= 100) return { status: 'done', pct: 100 };
+  if (pct < 0) return { status: 'upcoming', pct: 0 };
+  if (pct >= 75) return { status: 'wrapping', pct };
+  return { status: 'live', pct };
+}
+
+/* ---------- Time-lapsed within a day's working-hours window, OOO-aware ---------- */
+function computeTimeLapsed(hours, oooForDay, nowDate){
+  const startMin = minutesSinceMidnight(hours.start);
+  const endMin = minutesSinceMidnight(hours.end);
+  const windowMin = Math.max(endMin - startMin, 0);
+  if (oooForDay && oooForDay.fullDay) return { fullDayOff: true, percent: 0, effectiveWindow: 0 };
+
+  const blocks = (oooForDay && oooForDay.blocks) || [];
+  const oooTotal = blocks.reduce((s, b) => s + Math.max(0, minutesSinceMidnight(b.end) - minutesSinceMidnight(b.start)), 0);
+  const effectiveWindow = Math.max(windowMin - oooTotal, 0);
+
+  const nowMin = nowDate.getHours() * 60 + nowDate.getMinutes();
+  let oooElapsed = 0;
+  blocks.forEach(b => {
+    const bStart = Math.max(minutesSinceMidnight(b.start), startMin);
+    const bEnd = Math.min(minutesSinceMidnight(b.end), endMin, nowMin);
+    if (bEnd > bStart) oooElapsed += (bEnd - bStart);
+  });
+  const rawElapsed = Math.max(0, Math.min(nowMin, endMin) - startMin);
+  const netElapsed = Math.max(0, rawElapsed - oooElapsed);
+  const percent = effectiveWindow > 0 ? Math.max(0, Math.min(100, Math.round((netElapsed / effectiveWindow) * 100))) : 0;
+  return { fullDayOff: false, percent, effectiveWindow };
+}
+
+// Same idea as computeTimeLapsed but summed across Monday–Friday of a given week,
+// skipping any day marked Out of Office for the full day.
+function computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, monday, today){
+  let totalMin = 0, elapsedMin = 0;
+  for (let i = 0; i < 5; i++){
+    const d = new Date(monday); d.setDate(d.getDate() + i);
+    const iso = isoOf(d);
+    const dayOoo = oooRanges[iso];
+    if (dayOoo && dayOoo.fullDay) continue;
+    const hours = getWorkingHours(workingHours, defaultWorkingHours, iso);
+    const lapsed = computeTimeLapsed(hours, dayOoo, new Date());
+    if (iso < today){
+      totalMin += lapsed.effectiveWindow;
+      elapsedMin += lapsed.effectiveWindow;
+    } else if (iso === today){
+      totalMin += lapsed.effectiveWindow;
+      elapsedMin += Math.round((lapsed.percent / 100) * lapsed.effectiveWindow);
+    } else {
+      totalMin += lapsed.effectiveWindow;
+    }
+  }
+  const percent = totalMin > 0 ? Math.round((elapsedMin / totalMin) * 100) : 0;
+  return { percent, totalMin, elapsedMin };
+}
+
+/* ---------- A little personality ---------- */
+function getTimeGreeting(hour){
+  if (hour < 5) return 'Still up';
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  if (hour < 21) return 'Good evening';
+  return 'Winding down';
+}
+
+function getAssistantMessage({ meetingsToday, tasksDueToday, atRiskCount, dailyProgress, timeElapsedPercent }){
+  if (atRiskCount > 0) {
+    return `${atRiskCount} task${atRiskCount > 1 ? 's need' : ' needs'} attention — worth a look before ${atRiskCount > 1 ? 'they slip' : 'it slips'} further.`;
+  }
+  if (dailyProgress.percent !== null && dailyProgress.percent >= 100) {
+    return "Today's task list is fully wrapped — nice work.";
+  }
+  if (meetingsToday === 0 && tasksDueToday === 0) {
+    return "Nothing urgent on deck today — a good day to chip away at the backlog.";
+  }
+  if (dailyProgress.percent !== null && timeElapsedPercent > 0 && dailyProgress.percent >= timeElapsedPercent) {
+    return "You're on pace for today — keep it up.";
+  }
+  if (meetingsToday > 0 && tasksDueToday > 0) {
+    return `${meetingsToday} meeting${meetingsToday > 1 ? 's' : ''} and ${tasksDueToday} task${tasksDueToday > 1 ? 's' : ''} on deck today.`;
+  }
+  if (meetingsToday > 0) return `${meetingsToday} meeting${meetingsToday > 1 ? 's' : ''} on the calendar today.`;
+  if (tasksDueToday > 0) return `${tasksDueToday} task${tasksDueToday > 1 ? 's' : ''} due today.`;
+  return "Here's what's on deck today.";
 }
 
 function getSeedData(){
@@ -218,10 +343,10 @@ function getSeedData(){
     categoryCounter: DEFAULT_CATEGORIES.length + 1,
     meetings: [],
     tasks: [
-      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, startDate: '', endDate: todayISO(), notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' },
-      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' },
-      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' },
-      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  startDate: '', endDate: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '', weight: 1, completedAt: '' }
+      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, startDate: '', endDate: todayISO(), notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] },
+      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] },
+      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] },
+      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  startDate: '', endDate: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] }
     ],
     quickLinks: [
       { id: uid(), label: 'PRD Master Folder',    url: 'https://drive.google.com',  type: 'drive', tag: 'Masters' },
@@ -231,6 +356,78 @@ function getSeedData(){
     pendingMeetings: [],
     plannedMeetings: []
   };
+}
+
+function AssistantBanner({ message }){
+  return (
+    <div className="assistant-banner">
+      <span className="assistant-banner__icon">&#10022;</span>
+      <span>{message}</span>
+    </div>
+  );
+}
+
+function StickyNotesPanel({ notes, onAdd, onDelete }){
+  const [text, setText] = useState('');
+
+  function submit(){
+    if (!text.trim()) return;
+    onAdd(text.trim());
+    setText('');
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel__head" style={{ marginBottom: 10 }}>
+        <div>
+          <p className="panel__eyebrow">Quick Notes</p>
+          <h2 className="panel__title">Jot it down, file it later</h2>
+        </div>
+      </div>
+      <div className="quick-add-row">
+        <input type="text" placeholder="Something worth remembering…" value={text}
+          onChange={e => setText(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); }} style={{ flex: '3 1 260px' }} />
+        <button className="btn btn--amber" onClick={submit}>Add note</button>
+      </div>
+      {notes.length > 0 && (
+        <div className="sticky-note-list">
+          {notes.map(n => (
+            <div key={n.id} className="sticky-note">
+              <span>{n.text}</span>
+              <button className="icon-btn" title="Filed elsewhere — remove" onClick={() => onDelete(n.id)}>&times;</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function EndOfDayModal({ notes, onClose }){
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">End of day</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 19, fontWeight: 700 }}>You've got {notes.length} unfiled quick note{notes.length === 1 ? '' : 's'}</div>
+          </div>
+        </div>
+        <div className="modal-field">
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 10 }}>
+            Move these into a task, a meeting's notes, or wherever they belong — otherwise they'll remind you again first thing tomorrow.
+          </p>
+          <div className="sticky-note-list">
+            {notes.map(n => <div key={n.id} className="sticky-note"><span>{n.text}</span></div>)}
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn--amber" onClick={onClose} style={{ marginLeft: 'auto' }}>Got it</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ============================== Small components ============================== */
@@ -327,11 +524,12 @@ function TodayMeetingsCard({ meetings, plannedMeetings, pendingMeetings, todayId
         <div className="today-list">
           {todayRecurring.map(m => {
             const mt = MEETING_TYPES[m.type];
+            const status = getMeetingStatus(today, m.time, m.duration);
             return (
-              <div key={m.id} className="today-item" style={{ '--type-color': mt.color }} onClick={onClickMeeting}>
+              <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': mt.color }} onClick={onClickMeeting}>
                 <span className="today-item__time">{m.time}</span>
                 <span className="today-item__title">{m.name}</span>
-                <span className="pill" style={{ '--pill-color': mt.color, '--pill-bg': mt.dim }}>{mt.label}</span>
+                {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': mt.color, '--pill-bg': mt.dim }}>{mt.label}</span>}
               </div>
             );
           })}
@@ -339,11 +537,12 @@ function TodayMeetingsCard({ meetings, plannedMeetings, pendingMeetings, todayId
             const isFocus = m.kind === 'focus';
             const color = isFocus ? 'var(--green)' : 'var(--purple)';
             const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
+            const status = getMeetingStatus(today, m.time || '00:00', m.duration);
             return (
-              <div key={m.id} className="today-item" style={{ '--type-color': color }} onClick={onClickMeeting}>
+              <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': color }} onClick={onClickMeeting}>
                 <span className="today-item__time">{m.time || '—'}</span>
                 <span className="today-item__title">{m.title}</span>
-                <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>
+                {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>}
               </div>
             );
           })}
@@ -463,11 +662,61 @@ function AddMeetingForm({ open, onCancel, onSubmit }){
   );
 }
 
-function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting }){
+function meetingStatusPill(status){
+  if (status.status === 'done') return <span className="pill" style={{ '--pill-color': 'var(--green)', '--pill-bg': 'var(--green-dim)' }}>&#10003; Completed</span>;
+  if (status.status === 'wrapping') return <span className="pill" style={{ '--pill-color': 'var(--amber)', '--pill-bg': 'var(--amber-dim)' }}>Wrapping up &middot; check agenda</span>;
+  return null;
+}
+
+function DayHoursPanel({ iso, workingHours, defaultWorkingHours, oooRanges, onSetWorkingHours, onToggleFullDayOOO, onAddOOOBlock, onDeleteOOOBlock }){
+  const hours = getWorkingHours(workingHours, defaultWorkingHours, iso);
+  const ooo = oooRanges[iso] || { fullDay: false, blocks: [] };
+  const [oooStart, setOooStart] = useState('12:00');
+  const [oooEnd, setOooEnd] = useState('13:00');
+
+  return (
+    <div className="day-hours-panel">
+      <div className="day-hours-panel__row">
+        <label>Working hours</label>
+        <TimeSelect value={hours.start} onChange={start => onSetWorkingHours(iso, { ...hours, start })} />
+        <span style={{ color: 'var(--text-faint)' }}>&rarr;</span>
+        <TimeSelect value={hours.end} onChange={end => onSetWorkingHours(iso, { ...hours, end })} />
+      </div>
+      <div className="day-hours-panel__row">
+        <button className={`btn${ooo.fullDay ? ' btn--danger' : ' btn--ghost'}`} onClick={() => onToggleFullDayOOO(iso)}>
+          {ooo.fullDay ? 'Out of office all day — click to undo' : 'Mark whole day Out of Office'}
+        </button>
+      </div>
+      {!ooo.fullDay && (
+        <React.Fragment>
+          {(ooo.blocks || []).length > 0 && (
+            <div className="ooo-block-list">
+              {ooo.blocks.map(b => (
+                <div key={b.id} className="ooo-block">
+                  <span>{b.start} &ndash; {b.end}</span>
+                  <button className="icon-btn" onClick={() => onDeleteOOOBlock(iso, b.id)}>&times;</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="day-hours-panel__row">
+            <TimeSelect value={oooStart} onChange={setOooStart} />
+            <span style={{ color: 'var(--text-faint)' }}>&rarr;</span>
+            <TimeSelect value={oooEnd} onChange={setOooEnd} />
+            <button className="btn" onClick={() => onAddOOOBlock(iso, oooStart, oooEnd)}>+ Out of office block</button>
+          </div>
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting, workingHours, defaultWorkingHours, oooRanges, onSetWorkingHours, onToggleFullDayOOO, onAddOOOBlock, onDeleteOOOBlock }){
   const monday = getMonday(new Date(Date.now() + weekOffset * 7 * 86400000));
   const parity = getParity(monday);
   const sunday = new Date(monday); sunday.setDate(sunday.getDate() + 6);
   const todayStr = new Date().toDateString();
+  const [expandedDay, setExpandedDay] = useState(null);
 
   function meetingsForDay(dayIndex){
     return meetings
@@ -493,7 +742,9 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
 
       <AddMeetingForm open={addOpen} onCancel={() => setAddOpen(false)} onSubmit={m => { onAddMeeting(m); setAddOpen(false); }} />
 
-      <div className="schedule-grid" style={{ marginTop: 14 }}>
+      <p style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', margin: '10px 0 0' }}>Click a day's date to view or edit its working hours &amp; Out of Office blocks.</p>
+
+      <div className="schedule-grid" style={{ marginTop: 10 }}>
         {Array.from({ length: 7 }).map((_, i) => {
           const d = new Date(monday); d.setDate(d.getDate() + i);
           const isToday = d.toDateString() === todayStr;
@@ -502,9 +753,25 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
           const dayPlanned = plannedMeetings.filter(m => m.date === iso).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
           const dayPlaceholders = pendingMeetings.filter(m => m.targetDate === iso);
           const hasAnything = dayMeetings.length > 0 || dayPlanned.length > 0 || dayPlaceholders.length > 0;
+          const dayOoo = oooRanges[iso];
           return (
             <div key={i} className={`schedule-day${isToday ? ' is-today' : ''}`}>
-              <div className="schedule-day__head">{WEEKDAY_LABELS[i]}<b>{d.getDate()} {MONTHS[d.getMonth()]}</b></div>
+              <div className="schedule-day__head" style={{ cursor: 'pointer' }} onClick={() => setExpandedDay(x => (x === iso ? null : iso))}>
+                {WEEKDAY_LABELS[i]}<b>{d.getDate()} {MONTHS[d.getMonth()]}</b>
+                {dayOoo && dayOoo.fullDay && <span className="pill" style={{ '--pill-color': 'var(--red)', '--pill-bg': 'var(--red-dim)', marginTop: 4, display: 'inline-block' }}>OOO</span>}
+              </div>
+              {expandedDay === iso && (
+                <DayHoursPanel
+                  iso={iso}
+                  workingHours={workingHours}
+                  defaultWorkingHours={defaultWorkingHours}
+                  oooRanges={oooRanges}
+                  onSetWorkingHours={onSetWorkingHours}
+                  onToggleFullDayOOO={onToggleFullDayOOO}
+                  onAddOOOBlock={onAddOOOBlock}
+                  onDeleteOOOBlock={onDeleteOOOBlock}
+                />
+              )}
               <div className="schedule-day__list">
                 {!hasAnything ? (
                   <div className="schedule-day__empty">No syncs</div>
@@ -512,13 +779,14 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
                   <React.Fragment>
                     {dayMeetings.map(m => {
                       const t = MEETING_TYPES[m.type];
+                      const status = getMeetingStatus(iso, m.time, m.duration);
                       return (
-                        <div key={m.id} className="meeting-block" style={{ '--type-color': t.color }}>
+                        <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': t.color }}>
                           <button className="meeting-block__del" title="Remove" onClick={() => onDeleteMeeting(m.id)}>&times;</button>
                           <div className="meeting-block__time">{m.time} &middot; {formatDuration(m.duration || 30)}</div>
                           <div className="meeting-block__name">{m.name}</div>
                           <div className="meeting-block__foot">
-                            <span className="pill" style={{ '--pill-color': t.color, '--pill-bg': t.dim }}>{t.label}</span>
+                            {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': t.color, '--pill-bg': t.dim }}>{t.label}</span>}
                             <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.cadence === 'weekly' ? 'WK' : 'FN'}</span>
                           </div>
                         </div>
@@ -528,14 +796,15 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
                       const isFocus = m.kind === 'focus';
                       const color = isFocus ? 'var(--green)' : 'var(--purple)';
                       const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
+                      const status = getMeetingStatus(iso, m.time || '00:00', m.duration);
                       return (
-                        <div key={m.id} className="meeting-block" style={{ '--type-color': color, cursor: isFocus ? 'default' : 'pointer' }}
+                        <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': color, cursor: isFocus ? 'default' : 'pointer' }}
                           onClick={() => { if (!isFocus) onOpenMeeting(m.id); }}>
                           <button className="meeting-block__del" title="Remove" onClick={e => { e.stopPropagation(); onDeletePlanned(m.id); }}>&times;</button>
                           <div className="meeting-block__time">{m.time || '—'} &middot; {formatDuration(m.duration || 30)}</div>
                           <div className="meeting-block__name">{m.title}</div>
                           <div className="meeting-block__foot">
-                            <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>
+                            {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>}
                             {!isFocus && (m.agenda || []).length > 0 && (
                               <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.agenda.length} agenda</span>
                             )}
@@ -1207,12 +1476,61 @@ function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onRe
         </div>
       </div>
       <button className={`icon-btn${task.atRisk ? ' flag-on' : ''}`} title="Flag at risk" onClick={onToggleRisk}>&#9873;</button>
+      {task.subtasks && task.subtasks.length > 0 && (
+        <span className="subtask-badge" title="Sub-task progress">{task.subtasks.filter(s => s.done).length}/{task.subtasks.length}</span>
+      )}
       <button className={`icon-btn${hasContent ? ' link-on' : ''}`} title="Open details & notes" onClick={onOpenDetail}>&#8942;</button>
     </div>
   );
 }
 
-function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onReviseDue, onSetFocusTime }){
+function SubtaskList({ task, onAdd, onToggle, onUpdate, onDelete }){
+  const [title, setTitle] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const subtasks = task.subtasks || [];
+  const doneCount = subtasks.filter(s => s.done).length;
+
+  function submit(){
+    if (!title.trim()) return;
+    onAdd(title.trim(), startDate, endDate);
+    setTitle(''); setStartDate(''); setEndDate('');
+  }
+
+  return (
+    <div>
+      {subtasks.length > 0 && (
+        <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 8 }}>{doneCount}/{subtasks.length} complete</p>
+      )}
+      {subtasks.length > 0 && (
+        <div className="subtask-list">
+          {subtasks.map(s => (
+            <div key={s.id} className={`subtask-item${s.done ? ' done' : ''}`}>
+              <input type="checkbox" checked={s.done} onChange={() => onToggle(s.id)} />
+              <span className="subtask-item__title">{s.title}</span>
+              <input type="date" className="subtask-item__date" value={s.startDate || ''} title="Start date (can't be before the task's own start)"
+                onChange={e => onUpdate(s.id, { startDate: e.target.value })} />
+              <span style={{ color: 'var(--text-faint)', fontSize: 10 }}>&rarr;</span>
+              <input type="date" className="subtask-item__date" value={s.endDate || ''} title="End date (can't be after the task's own end)"
+                onChange={e => onUpdate(s.id, { endDate: e.target.value })} />
+              <button className="icon-btn" title="Remove" onClick={() => onDelete(s.id)}>&times;</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="agenda-add">
+        <input type="text" placeholder="Add a sub-task…" value={title}
+          onChange={e => setTitle(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
+        <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} title="Start date (optional)" />
+        <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} title="End date (optional)" />
+        <button className="btn" onClick={submit}>Add</button>
+      </div>
+    </div>
+  );
+}
+
+function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onReviseDue, onSetFocusTime, onAddSubtask, onToggleSubtask, onUpdateSubtask, onDeleteSubtask }){
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
     document.addEventListener('keydown', onKey);
@@ -1322,6 +1640,17 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
               value={task.closingRemark || ''} onChange={e => onUpdate({ closingRemark: e.target.value })} />
           </div>
         )}
+
+        <div className="modal-field">
+          <label>Sub-tasks</label>
+          <SubtaskList
+            task={task}
+            onAdd={(title, s, e) => onAddSubtask(title, s, e)}
+            onToggle={id => onToggleSubtask(id)}
+            onUpdate={(id, patch) => onUpdateSubtask(id, patch)}
+            onDelete={id => onDeleteSubtask(id)}
+          />
+        </div>
 
         <div className="modal-field">
           <label>Detailed notes</label>
@@ -1450,10 +1779,14 @@ function ProgressBar({ percent, color }){
   );
 }
 
-function ProgressPanel({ dailyProgress, weeklyProgress, timeElapsedPercent }){
+function ProgressPanel({ dailyProgress, weeklyProgress, timeElapsedPercent, weekElapsedPercent }){
   const dailyColor = dailyProgress.percent === null ? 'var(--text-faint)'
     : dailyProgress.percent >= timeElapsedPercent ? 'var(--green)'
     : (timeElapsedPercent - dailyProgress.percent <= 15 ? 'var(--amber)' : 'var(--red)');
+
+  const weeklyColor = weeklyProgress.percent === null ? 'var(--text-faint)'
+    : weeklyProgress.percent >= weekElapsedPercent ? 'var(--green)'
+    : (weekElapsedPercent - weeklyProgress.percent <= 15 ? 'var(--amber)' : 'var(--red)');
 
   return (
     <section className="panel">
@@ -1483,55 +1816,45 @@ function ProgressPanel({ dailyProgress, weeklyProgress, timeElapsedPercent }){
           <span>This Week</span>
           <span>{weeklyProgress.percent === null ? 'No tasks this week' : `${weeklyProgress.percent}% complete`}</span>
         </div>
-        <ProgressBar percent={weeklyProgress.percent} color="var(--cyan)" />
+        <ProgressBar percent={weeklyProgress.percent} color={weeklyColor} />
+        <div className="progress-row__sub">
+          <span>Week elapsed (Mon&ndash;Fri): {weekElapsedPercent}%</span>
+          {weeklyProgress.percent !== null && (
+            <span>{weeklyProgress.percent >= weekElapsedPercent ? 'On pace' : 'Behind pace'}</span>
+          )}
+        </div>
       </div>
     </section>
   );
 }
 
-function WorkingHoursPanel({ workingHours, defaultWorkingHours, onSet }){
-  const [open, setOpen] = useState(false);
-  const [date, setDate] = useState(todayISO());
-  const [start, setStart] = useState(defaultWorkingHours.start);
-  const [end, setEnd] = useState(defaultWorkingHours.end);
-
-  function submit(){
-    onSet(date, { start, end });
-    setOpen(false);
-  }
+function TimeLapsedPanel({ workingHours, defaultWorkingHours, oooRanges, now }){
+  const today = todayISO();
+  const hours = getWorkingHours(workingHours, defaultWorkingHours, today);
+  const ooo = oooRanges[today];
+  const lapsed = computeTimeLapsed(hours, ooo, now);
 
   return (
     <section className="panel">
-      <div className="panel__head">
+      <div className="panel__head" style={{ marginBottom: 10 }}>
         <div>
-          <p className="panel__eyebrow">Working Hours</p>
-          <h2 className="panel__title">Today: {getWorkingHours(workingHours, defaultWorkingHours, todayISO()).start} &ndash; {getWorkingHours(workingHours, defaultWorkingHours, todayISO()).end}</h2>
-        </div>
-        <button className="btn" onClick={() => setOpen(o => !o)}>Set hours for a day</button>
-      </div>
-      <div className={`add-form${open ? ' open' : ''}`}>
-        <div>
-          <label>Date</label>
-          <input type="date" value={date} onChange={e => setDate(e.target.value)} />
-        </div>
-        <div>
-          <label>Start</label>
-          <TimeSelect value={start} onChange={setStart} />
-        </div>
-        <div>
-          <label>End</label>
-          <TimeSelect value={end} onChange={setEnd} />
-        </div>
-        <div className="full">
-          <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
-          <button className="btn btn--amber" onClick={submit}>Save</button>
+          <p className="panel__eyebrow">Time Lapsed</p>
+          <h2 className="panel__title">Today's working window: {hours.start} &ndash; {hours.end}</h2>
         </div>
       </div>
+      {lapsed.fullDayOff ? (
+        <p style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-lo)' }}>Out of office today &mdash; no working hours tracked.</p>
+      ) : (
+        <React.Fragment>
+          <ProgressBar percent={lapsed.percent} color="var(--cyan)" />
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginTop: 8 }}>{lapsed.percent}% of today's working hours elapsed</p>
+        </React.Fragment>
+      )}
     </section>
   );
 }
 
-function DailyPlannerModal({ defaultWorkingHours, todayMeetings, todayTasks, categories, onAddTask, onAddMeeting, onClose }){
+function DailyPlannerModal({ defaultWorkingHours, todayMeetings, todayTasks, categories, unfiledNotes, onDeleteNote, onAddTask, onAddMeeting, onClose }){
   const [start, setStart] = useState(defaultWorkingHours.start);
   const [end, setEnd] = useState(defaultWorkingHours.end);
   const [taskTitle, setTaskTitle] = useState('');
@@ -1556,10 +1879,24 @@ function DailyPlannerModal({ defaultWorkingHours, todayMeetings, todayTasks, cat
       <div className="modal-panel">
         <div className="modal-panel__head">
           <div style={{ flex: 1 }}>
-            <p className="panel__eyebrow">Good morning</p>
+            <p className="panel__eyebrow">{getTimeGreeting(new Date().getHours())}</p>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>Set up today</div>
           </div>
         </div>
+
+        {unfiledNotes.length > 0 && (
+          <div className="modal-field">
+            <label style={{ color: 'var(--amber)' }}>Unfiled notes from before</label>
+            <div className="sticky-note-list">
+              {unfiledNotes.map(n => (
+                <div key={n.id} className="sticky-note">
+                  <span>{n.text}</span>
+                  <button className="icon-btn" title="Filed elsewhere — remove" onClick={() => onDeleteNote(n.id)}>&times;</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="modal-field">
           <label>Working hours for today</label>
@@ -1692,9 +2029,107 @@ function WeeklyDigestModal({ weekLabel, categories, tasks, onClose }){
   );
 }
 
+/* ============================== Auth ============================== */
+
+function ConfigMissingNotice(){
+  return (
+    <div className="app" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+      <div className="modal-panel" style={{ maxWidth: 440 }}>
+        <p className="panel__eyebrow">Setup needed</p>
+        <div style={{ fontFamily: 'var(--font-display)', fontSize: 19, fontWeight: 700, marginBottom: 10 }}>Supabase isn't configured yet</div>
+        <p style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-lo)', lineHeight: 1.6 }}>
+          Edit <code>config.js</code> in your repo and replace the placeholder <code>url</code> and <code>anonKey</code> with the values
+          from your Supabase project's Settings &rarr; API page, then commit and refresh.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function LoadingScreen({ message }){
+  return (
+    <div className="app" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+      <p style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--text-lo)' }}>{message}</p>
+    </div>
+  );
+}
+
+function AuthGate(){
+  const [email, setEmail] = useState('');
+  const [stage, setStage] = useState('email'); // 'email' | 'otp'
+  const [code, setCode] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function sendCode(){
+    if (!email.trim()) return;
+    setBusy(true); setError('');
+    const { error } = await supabaseClient.auth.signInWithOtp({ email: email.trim(), options: { shouldCreateUser: true } });
+    setBusy(false);
+    if (error) { setError(error.message); return; }
+    setStage('otp');
+  }
+
+  async function verifyCode(){
+    if (!code.trim()) return;
+    setBusy(true); setError('');
+    const { error } = await supabaseClient.auth.verifyOtp({ email: email.trim(), token: code.trim(), type: 'email' });
+    setBusy(false);
+    if (error) { setError(error.message); return; }
+    // A successful verification updates the session; App's onAuthStateChange
+    // listener picks it up automatically and swaps this screen out.
+  }
+
+  return (
+    <div className="app" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh' }}>
+      <div className="modal-panel" style={{ maxWidth: 400 }}>
+        <div className="modal-panel__head">
+          <div>
+            <p className="panel__eyebrow">Control Centre</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>
+              {stage === 'email' ? 'Sign in' : 'Enter your code'}
+            </div>
+          </div>
+        </div>
+
+        {stage === 'email' ? (
+          <React.Fragment>
+            <div className="modal-field">
+              <label>Email</label>
+              <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com"
+                onKeyDown={e => { if (e.key === 'Enter') sendCode(); }} autoFocus />
+            </div>
+            {error && <p style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>{error}</p>}
+            <div className="modal-footer">
+              <button className="btn btn--amber" disabled={busy} onClick={sendCode} style={{ marginLeft: 'auto' }}>
+                {busy ? 'Sending…' : 'Send code'}
+              </button>
+            </div>
+          </React.Fragment>
+        ) : (
+          <React.Fragment>
+            <p style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-lo)' }}>We sent a 6-digit code to {email}.</p>
+            <div className="modal-field">
+              <label>Code</label>
+              <input type="text" inputMode="numeric" value={code} onChange={e => setCode(e.target.value)} placeholder="123456"
+                onKeyDown={e => { if (e.key === 'Enter') verifyCode(); }} autoFocus />
+            </div>
+            {error && <p style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>{error}</p>}
+            <div className="modal-footer">
+              <button className="btn btn--ghost" onClick={() => { setStage('email'); setCode(''); setError(''); }}>Back</button>
+              <button className="btn btn--amber" disabled={busy} onClick={verifyCode}>{busy ? 'Verifying…' : 'Verify & sign in'}</button>
+            </div>
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /* ============================== App ============================== */
 
 function App(){
+  const [session, setSession] = useState(undefined); // undefined = still checking, null = signed out
   const [loaded, setLoaded] = useState(false);
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [categoryCounter, setCategoryCounter] = useState(DEFAULT_CATEGORIES.length + 1);
@@ -1719,79 +2154,139 @@ function App(){
   const [lastDigestWeek, setLastDigestWeek] = useState('');
   const [dailyPlannerOpen, setDailyPlannerOpen] = useState(false);
   const [digestOpen, setDigestOpen] = useState(false);
+  const [oooRanges, setOooRanges] = useState({});
+  const [stickyNotes, setStickyNotes] = useState([]);
+  const [lastEodPromptDate, setLastEodPromptDate] = useState('');
+  const [eodModalOpen, setEodModalOpen] = useState(false);
+  const saveTimer = useRef(null);
 
-  // Load once on mount
+  // Check for an existing session on load, and keep listening for sign-in/out.
   useEffect(() => {
-    let resumedLastVisit = '';
-    let resumedDigestWeek = '';
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        // Older saves won't have `categories` yet — fall back to the original 4 so
-        // existing tasks (which reference these ids) keep resolving correctly.
-        const cats = (parsed.categories && parsed.categories.length) ? parsed.categories : DEFAULT_CATEGORIES;
-        setCategories(cats);
-        setCategoryCounter(parsed.categoryCounter || (cats.length + 1));
-        setMeetings(parsed.meetings || []);
-        setTasks(parsed.tasks || []);
-        setQuickLinks(parsed.quickLinks || []);
-        setLinkTags((parsed.linkTags && parsed.linkTags.length) ? parsed.linkTags : DEFAULT_LINK_TAGS);
-        setPendingMeetings(parsed.pendingMeetings || []);
-        setPlannedMeetings(parsed.plannedMeetings || []);
-        setSettings(Object.assign({ calendarEmbedUrl: '' }, parsed.settings || {}));
-        setWorkingHours(parsed.workingHours || {});
-        setDefaultWorkingHours(parsed.defaultWorkingHours || { start: '09:00', end: '18:00' });
-        resumedLastVisit = parsed.lastVisitDate || '';
-        resumedDigestWeek = parsed.lastDigestWeek || '';
-        setLastVisitDate(resumedLastVisit);
-        setLastDigestWeek(resumedDigestWeek);
-      } else {
-        const seed = getSeedData();
-        setCategories(seed.categories);
-        setCategoryCounter(seed.categoryCounter);
-        setMeetings(seed.meetings);
-        setTasks(seed.tasks);
-        setQuickLinks(seed.quickLinks);
-        setLinkTags(seed.linkTags);
-        setPendingMeetings(seed.pendingMeetings);
-        setPlannedMeetings(seed.plannedMeetings);
-      }
-    } catch (e) {
-      console.error('Failed to load saved data', e);
-    }
-
-    const today = todayISO();
-    if (resumedLastVisit !== today) setDailyPlannerOpen(true);
-    const isFriday = new Date().getDay() === 5;
-    const mondayIso = isoOf(getMonday(new Date()));
-    if (isFriday && resumedDigestWeek !== mondayIso) setDigestOpen(true);
-
-    setLoaded(true);
+    if (!supabaseClient) { setSession(null); return; }
+    supabaseClient.auth.getSession().then(({ data }) => setSession(data.session || null));
+    const { data: listener } = supabaseClient.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+    });
+    return () => listener.subscription.unsubscribe();
   }, []);
 
-  // Save whenever data changes (skip the very first render, before load completes)
+  function applyLoadedData(parsed){
+    const cats = (parsed.categories && parsed.categories.length) ? parsed.categories : DEFAULT_CATEGORIES;
+    setCategories(cats);
+    setCategoryCounter(parsed.categoryCounter || (cats.length + 1));
+    setMeetings(parsed.meetings || []);
+    setTasks(parsed.tasks || []);
+    setQuickLinks(parsed.quickLinks || []);
+    setLinkTags((parsed.linkTags && parsed.linkTags.length) ? parsed.linkTags : DEFAULT_LINK_TAGS);
+    setPendingMeetings(parsed.pendingMeetings || []);
+    setPlannedMeetings(parsed.plannedMeetings || []);
+    setSettings(Object.assign({ calendarEmbedUrl: '' }, parsed.settings || {}));
+    setWorkingHours(parsed.workingHours || {});
+    setDefaultWorkingHours(parsed.defaultWorkingHours || { start: '09:00', end: '18:00' });
+    setOooRanges(parsed.oooRanges || {});
+    setStickyNotes(parsed.stickyNotes || []);
+    setLastEodPromptDate(parsed.lastEodPromptDate || '');
+    return { lastVisitDate: parsed.lastVisitDate || '', lastDigestWeek: parsed.lastDigestWeek || '' };
+  }
+
+  // Once signed in, load this user's data from Supabase (each user's row is
+  // walled off from everyone else's by the database's row-level security).
   useEffect(() => {
-    if (!loaded) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    if (!session) { setLoaded(false); return; }
+    let cancelled = false;
+
+    (async () => {
+      let resumedLastVisit = '';
+      let resumedDigestWeek = '';
+      try {
+        const { data, error } = await supabaseClient
+          .from('app_state')
+          .select('data')
+          .eq('user_id', session.user.id)
+          .maybeSingle();
+        if (error) throw error;
+        if (cancelled) return;
+
+        if (data && data.data && Object.keys(data.data).length > 0) {
+          const resumed = applyLoadedData(data.data);
+          resumedLastVisit = resumed.lastVisitDate;
+          resumedDigestWeek = resumed.lastDigestWeek;
+          setLastVisitDate(resumedLastVisit);
+          setLastDigestWeek(resumedDigestWeek);
+        } else {
+          const seed = getSeedData();
+          setCategories(seed.categories);
+          setCategoryCounter(seed.categoryCounter);
+          setMeetings(seed.meetings);
+          setTasks(seed.tasks);
+          setQuickLinks(seed.quickLinks);
+          setLinkTags(seed.linkTags);
+          setPendingMeetings(seed.pendingMeetings);
+          setPlannedMeetings(seed.plannedMeetings);
+        }
+      } catch (e) {
+        console.error('Failed to load cloud data', e);
+      }
+      if (cancelled) return;
+
+      const today = todayISO();
+      if (resumedLastVisit !== today) setDailyPlannerOpen(true);
+      const isFriday = new Date().getDay() === 5;
+      const mondayIso = isoOf(getMonday(new Date()));
+      if (isFriday && resumedDigestWeek !== mondayIso) setDigestOpen(true);
+
+      setLoaded(true);
+    })();
+
+    return () => { cancelled = true; };
+  }, [session]);
+
+  // Save whenever data changes, debounced so we're not hitting the database on
+  // every keystroke — skipped until the initial load for this user completes.
+  useEffect(() => {
+    if (!loaded || !session) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      const payload = {
         categories, categoryCounter, meetings, tasks, quickLinks, linkTags,
         pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours,
-        lastVisitDate, lastDigestWeek
-      }));
-      setSaved(true);
-      const t = setTimeout(() => setSaved(false), 900);
-      return () => clearTimeout(t);
-    } catch (e) {
-      console.error('Failed to save data', e);
-    }
-  }, [categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, loaded]);
+        lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate
+      };
+      supabaseClient
+        .from('app_state')
+        .upsert({ user_id: session.user.id, data: payload, updated_at: new Date().toISOString() })
+        .then(({ error }) => {
+          if (error) { console.error('Failed to save cloud data', error); return; }
+          setSaved(true);
+          setTimeout(() => setSaved(false), 900);
+        });
+    }, 800);
+    return () => clearTimeout(saveTimer.current);
+  }, [categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate, loaded, session]);
+
+  function signOut(){
+    supabaseClient.auth.signOut();
+  }
 
   // Clock
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  // End-of-day nudge: once the working day is over, if there are unfiled sticky notes
+  // and we haven't already nagged about them today, surface a one-time reminder.
+  useEffect(() => {
+    if (!loaded) return;
+    const today = todayISO();
+    if (lastEodPromptDate === today) return;
+    if (stickyNotes.length === 0) return;
+    const hours = getWorkingHours(workingHours, defaultWorkingHours, today);
+    const nowMin = now.getHours() * 60 + now.getMinutes();
+    if (nowMin >= minutesSinceMidnight(hours.end)) {
+      setEodModalOpen(true);
+    }
+  }, [now, loaded, stickyNotes, workingHours, defaultWorkingHours, lastEodPromptDate]);
 
   /* ---------- Category actions ---------- */
   function addCategory(title){
@@ -1908,6 +2403,69 @@ function App(){
     setDigestOpen(false);
   }
 
+  /* ---------- Out of office ---------- */
+  function toggleFullDayOOO(dateISO){
+    setOooRanges(o => {
+      const current = o[dateISO] || { fullDay: false, blocks: [] };
+      return { ...o, [dateISO]: { ...current, fullDay: !current.fullDay } };
+    });
+  }
+  function addOOOBlock(dateISO, start, end){
+    if (!start || !end || end <= start) return;
+    setOooRanges(o => {
+      const current = o[dateISO] || { fullDay: false, blocks: [] };
+      return { ...o, [dateISO]: { ...current, blocks: [...(current.blocks || []), { id: uid(), start, end }] } };
+    });
+  }
+  function deleteOOOBlock(dateISO, blockId){
+    setOooRanges(o => {
+      const current = o[dateISO];
+      if (!current) return o;
+      return { ...o, [dateISO]: { ...current, blocks: (current.blocks || []).filter(b => b.id !== blockId) } };
+    });
+  }
+
+  /* ---------- Sticky notes ---------- */
+  function addStickyNote(text){
+    setStickyNotes(ns => [...ns, { id: uid(), text, createdAt: todayISO() }]);
+  }
+  function deleteStickyNote(id){
+    setStickyNotes(ns => ns.filter(n => n.id !== id));
+  }
+  function closeEodModal(){
+    setLastEodPromptDate(todayISO());
+    setEodModalOpen(false);
+  }
+
+  /* ---------- Sub-tasks ---------- */
+  function addSubtask(taskId, title, startDate, endDate){
+    setTasks(ts => ts.map(t => {
+      if (t.id !== taskId) return t;
+      const clamped = clampSubtaskDates(t, startDate, endDate);
+      return { ...t, subtasks: [...(t.subtasks || []), { id: uid(), title, done: false, startDate: clamped.startDate, endDate: clamped.endDate }] };
+    }));
+  }
+  function toggleSubtask(taskId, subId){
+    setTasks(ts => ts.map(t => (t.id !== taskId ? t : { ...t, subtasks: (t.subtasks || []).map(s => (s.id === subId ? { ...s, done: !s.done } : s)) })));
+  }
+  function updateSubtask(taskId, subId, patch){
+    setTasks(ts => ts.map(t => {
+      if (t.id !== taskId) return t;
+      return {
+        ...t,
+        subtasks: (t.subtasks || []).map(s => {
+          if (s.id !== subId) return s;
+          const merged = { ...s, ...patch };
+          const clamped = clampSubtaskDates(t, merged.startDate, merged.endDate);
+          return { ...merged, ...clamped };
+        })
+      };
+    }));
+  }
+  function deleteSubtask(taskId, subId){
+    setTasks(ts => ts.map(t => (t.id !== taskId ? t : { ...t, subtasks: (t.subtasks || []).filter(s => s.id !== subId) })));
+  }
+
   /* ---------- Derived stats ---------- */
   const today = todayISO();
   const realMonday = getMonday(new Date());
@@ -1934,27 +2492,36 @@ function App(){
   const weeklyProgress = computeProgress(tasks, t => taskMatchesRange(t, weekStartIso, weekEndIso));
 
   const todayHours = getWorkingHours(workingHours, defaultWorkingHours, today);
-  const startMin = minutesSinceMidnight(todayHours.start);
-  const endMin = minutesSinceMidnight(todayHours.end);
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const windowMin = Math.max(endMin - startMin, 1);
-  const timeElapsedPercent = Math.max(0, Math.min(100, Math.round(((nowMin - startMin) / windowMin) * 100)));
+  const todayLapsed = computeTimeLapsed(todayHours, oooRanges[today], now);
+  const timeElapsedPercent = todayLapsed.fullDayOff ? 100 : todayLapsed.percent;
+  const weekLapsed = computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, realMonday, today);
+  const weekElapsedPercent = weekLapsed.percent;
+
+  const greeting = getTimeGreeting(now.getHours());
+  const assistantMessage = getAssistantMessage({ meetingsToday, tasksDueToday, atRiskCount, dailyProgress, timeElapsedPercent });
+
+  if (!supabaseClient) return <ConfigMissingNotice />;
+  if (session === undefined) return <LoadingScreen message="Checking your session…" />;
+  if (!session) return <AuthGate />;
+  if (!loaded) return <LoadingScreen message="Loading your data…" />;
 
   return (
     <div className="app">
       <header className="topbar">
         <div>
-          <p className="topbar__eyebrow">Product Operations</p>
+          <p className="topbar__eyebrow">{greeting} &middot; Product Operations</p>
           <h1 className="topbar__title">Control Centre</h1>
         </div>
         <div className="topbar__right">
           <div>
             <div className="sync-label"><span className={`sync-indicator${saved ? ' saved' : ''}`} /> Saved</div>
+            <div className="clock-date" style={{ marginTop: 4 }}>{session.user.email}</div>
           </div>
           <div>
             <div className="clock">{now.toLocaleTimeString('en-GB')}</div>
             <div className="clock-date">{WEEKDAY_LABELS[(now.getDay() + 6) % 7]}, {now.getDate()} {MONTHS[now.getMonth()]} {now.getFullYear()}</div>
           </div>
+          <button className="btn btn--ghost" onClick={signOut}>Sign out</button>
         </div>
       </header>
 
@@ -1968,6 +2535,8 @@ function App(){
 
       {activeTab === 'overview' && (
         <React.Fragment>
+          <AssistantBanner message={assistantMessage} />
+
           <section className="stats-strip">
             <StatChip label="Meetings today" value={meetingsToday} tone="amber" onClick={() => setActiveTab('calendar')} />
             <StatChip label="Tasks due today" value={tasksDueToday} tone="cyan" onClick={() => setActiveTab('tasks')} />
@@ -1975,7 +2544,9 @@ function App(){
             <StatChip label="Tasks done" value={doneCount} tone="green" onClick={() => setActiveTab('tasks')} />
           </section>
 
-          <ProgressPanel dailyProgress={dailyProgress} weeklyProgress={weeklyProgress} timeElapsedPercent={timeElapsedPercent} />
+          <ProgressPanel dailyProgress={dailyProgress} weeklyProgress={weeklyProgress} timeElapsedPercent={timeElapsedPercent} weekElapsedPercent={weekElapsedPercent} />
+
+          <StickyNotesPanel notes={stickyNotes} onAdd={addStickyNote} onDelete={deleteStickyNote} />
 
           {upcomingDeadlines.length > 0 && (
             <section className="panel deadlines-panel">
@@ -2016,10 +2587,11 @@ function App(){
 
       {activeTab === 'calendar' && (
         <React.Fragment>
-          <WorkingHoursPanel
+          <TimeLapsedPanel
             workingHours={workingHours}
             defaultWorkingHours={defaultWorkingHours}
-            onSet={setWorkingHoursForDate}
+            oooRanges={oooRanges}
+            now={now}
           />
           <PendingMeetingsPanel
             items={pendingMeetings}
@@ -2046,6 +2618,13 @@ function App(){
             addOpen={addMeetingOpen}
             setAddOpen={setAddMeetingOpen}
             onAddMeeting={addMeeting}
+            workingHours={workingHours}
+            defaultWorkingHours={defaultWorkingHours}
+            oooRanges={oooRanges}
+            onSetWorkingHours={setWorkingHoursForDate}
+            onToggleFullDayOOO={toggleFullDayOOO}
+            onAddOOOBlock={addOOOBlock}
+            onDeleteOOOBlock={deleteOOOBlock}
           />
           <CalendarPanel
             url={settings.calendarEmbedUrl}
@@ -2096,6 +2675,10 @@ function App(){
           onDelete={() => deleteTask(detailTaskId)}
           onReviseDue={date => reviseDueDate(detailTaskId, date)}
           onSetFocusTime={() => setFocusTaskId(detailTaskId)}
+          onAddSubtask={(title, s, e) => addSubtask(detailTaskId, title, s, e)}
+          onToggleSubtask={subId => toggleSubtask(detailTaskId, subId)}
+          onUpdateSubtask={(subId, patch) => updateSubtask(detailTaskId, subId, patch)}
+          onDeleteSubtask={subId => deleteSubtask(detailTaskId, subId)}
         />
       )}
 
@@ -2131,6 +2714,8 @@ function App(){
           ]}
           todayTasks={tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today))}
           categories={categories}
+          unfiledNotes={stickyNotes}
+          onDeleteNote={deleteStickyNote}
           onAddTask={addTask}
           onAddMeeting={addPlannedMeeting}
           onClose={hours => closeDailyPlanner(hours)}
@@ -2146,7 +2731,11 @@ function App(){
         />
       )}
 
-      <p className="footnote">Saved to this browser's local storage · a connected Google Calendar embed is only as private as your calendar's own sharing settings</p>
+      {eodModalOpen && (
+        <EndOfDayModal notes={stickyNotes} onClose={closeEodModal} />
+      )}
+
+      <p className="footnote">Synced to your account, private to {session.user.email} · a connected Google Calendar embed is only as private as your calendar's own sharing settings</p>
     </div>
   );
 }
