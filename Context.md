@@ -45,10 +45,29 @@ git push
 ```
 GitHub Pages redeploys automatically on every push to `main` — no separate build/deploy step needed.
 
-## Data & privacy
-All tasks, meetings, and links are saved to your browser's `localStorage`,
-scoped to whichever URL you're viewing. That means:
-- Data lives in *your* browser only — nothing is sent to a server.
-- Data is per-browser, per-device — it won't sync between your laptop and phone automatically.
-- Clearing your browser's site data for this URL will erase it. Worth doing a manual export (copy the JSON from
-  DevTools → Application → Local Storage) before big browser cleanups if you want a backup.
+## Accounts & storage (Supabase)
+
+The app now requires signing in with an email + one-time code before use, and
+data is stored in a Supabase project instead of the browser — that's what
+makes it safe to share the same deployed link with other people.
+
+### One-time setup
+1. Create a free project at [supabase.com](https://supabase.com).
+2. Open the SQL Editor and run everything in `supabase_setup.sql` (included in this repo) —
+   it creates the `app_state` table and the row-level security policies that keep
+   each person's data private to them.
+3. Authentication → Email Templates → Magic Link: replace `{{ .ConfirmationURL }}`
+   with `{{ .Token }}` so the email sends a 6-digit code instead of a clickable link.
+4. Authentication → URL Configuration: set Site URL (and add to Redirect URLs)
+   to your GitHub Pages URL.
+5. Project Settings → API: copy the **Project URL** and **`anon` `public`** key.
+6. Paste both into `config.js` in this repo, commit, and push.
+
+### How data & privacy work now
+- Each person signs in with their own email and gets their **own private data** —
+  not a shared pool. Nobody can read or write another user's row; that's enforced
+  by the database itself (Row Level Security), not just by the app's UI.
+- The `anon` key in `config.js` is meant to be public — it's safe to commit even
+  in a public repo. It only grants what the database's RLS policies allow.
+- If you ever need to wipe your own data, the cleanest way is deleting your row from the
+  `app_state` table in the Supabase Table Editor (Authentication → Users to also remove the account).
