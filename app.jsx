@@ -2056,28 +2056,25 @@ function LoadingScreen({ message }){
 
 function AuthGate(){
   const [email, setEmail] = useState('');
-  const [stage, setStage] = useState('email'); // 'email' | 'otp'
-  const [code, setCode] = useState('');
+  const [sent, setSent] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  async function sendCode(){
+  async function sendLink(){
     if (!email.trim()) return;
     setBusy(true); setError('');
-    const { error } = await supabaseClient.auth.signInWithOtp({ email: email.trim(), options: { shouldCreateUser: true } });
+    // Compute the redirect target from wherever this page is actually running,
+    // rather than relying on it matching Supabase's Site URL setting exactly.
+    // This still needs to be added under Authentication → URL Configuration →
+    // Redirect URLs in Supabase, but doesn't have to be the *default* Site URL.
+    const redirectTo = window.location.origin + window.location.pathname;
+    const { error } = await supabaseClient.auth.signInWithOtp({
+      email: email.trim(),
+      options: { shouldCreateUser: true, emailRedirectTo: redirectTo }
+    });
     setBusy(false);
     if (error) { setError(error.message); return; }
-    setStage('otp');
-  }
-
-  async function verifyCode(){
-    if (!code.trim()) return;
-    setBusy(true); setError('');
-    const { error } = await supabaseClient.auth.verifyOtp({ email: email.trim(), token: code.trim(), type: 'email' });
-    setBusy(false);
-    if (error) { setError(error.message); return; }
-    // A successful verification updates the session; App's onAuthStateChange
-    // listener picks it up automatically and swaps this screen out.
+    setSent(true);
   }
 
   return (
@@ -2086,38 +2083,31 @@ function AuthGate(){
         <div className="modal-panel__head">
           <div>
             <p className="panel__eyebrow">Control Centre</p>
-            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>
-              {stage === 'email' ? 'Sign in' : 'Enter your code'}
-            </div>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>Sign in</div>
           </div>
         </div>
 
-        {stage === 'email' ? (
+        {!sent ? (
           <React.Fragment>
             <div className="modal-field">
               <label>Email</label>
               <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com"
-                onKeyDown={e => { if (e.key === 'Enter') sendCode(); }} autoFocus />
+                onKeyDown={e => { if (e.key === 'Enter') sendLink(); }} autoFocus />
             </div>
             {error && <p style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>{error}</p>}
             <div className="modal-footer">
-              <button className="btn btn--amber" disabled={busy} onClick={sendCode} style={{ marginLeft: 'auto' }}>
-                {busy ? 'Sending…' : 'Send code'}
+              <button className="btn btn--amber" disabled={busy} onClick={sendLink} style={{ marginLeft: 'auto' }}>
+                {busy ? 'Sending…' : 'Send sign-in link'}
               </button>
             </div>
           </React.Fragment>
         ) : (
           <React.Fragment>
-            <p style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-lo)' }}>We sent a 6-digit code to {email}.</p>
-            <div className="modal-field">
-              <label>Code</label>
-              <input type="text" inputMode="numeric" value={code} onChange={e => setCode(e.target.value)} placeholder="123456"
-                onKeyDown={e => { if (e.key === 'Enter') verifyCode(); }} autoFocus />
-            </div>
-            {error && <p style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>{error}</p>}
+            <p style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-lo)', lineHeight: 1.6 }}>
+              Check {email} for a sign-in link. Click it and you'll land back here, signed in.
+            </p>
             <div className="modal-footer">
-              <button className="btn btn--ghost" onClick={() => { setStage('email'); setCode(''); setError(''); }}>Back</button>
-              <button className="btn btn--amber" disabled={busy} onClick={verifyCode}>{busy ? 'Verifying…' : 'Verify & sign in'}</button>
+              <button className="btn btn--ghost" onClick={() => { setSent(false); setError(''); }}>Use a different email</button>
             </div>
           </React.Fragment>
         )}
