@@ -308,6 +308,14 @@ function computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, monday,
 }
 
 /* ---------- A little personality ---------- */
+function getFirstNameFromEmail(email){
+  if (!email) return 'Your';
+  const local = (email.split('@')[0] || '').trim();
+  const first = (local.split('.')[0] || local).trim();
+  if (!first) return 'Your';
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+
 function getTimeGreeting(hour){
   if (hour < 5) return 'Still up';
   if (hour < 12) return 'Good morning';
@@ -2246,25 +2254,26 @@ function App(){
           setLinkTags(seed.linkTags);
           setPendingMeetings(seed.pendingMeetings);
           setPlannedMeetings(seed.plannedMeetings);
+        }
 
-          // No cloud data yet for this account — check whether this browser has
-          // data left over from before sign-in was added, and offer to bring it in.
-          try {
-            const legacyRaw = localStorage.getItem('control-centre-state');
-            if (legacyRaw) {
-              const legacyParsed = JSON.parse(legacyRaw);
-              const hasContent = legacyParsed && (
-                (legacyParsed.tasks && legacyParsed.tasks.length) ||
-                (legacyParsed.meetings && legacyParsed.meetings.length) ||
-                (legacyParsed.quickLinks && legacyParsed.quickLinks.length) ||
-                (legacyParsed.pendingMeetings && legacyParsed.pendingMeetings.length) ||
-                (legacyParsed.plannedMeetings && legacyParsed.plannedMeetings.length)
-              );
-              if (hasContent) setLegacyImport(legacyParsed);
-            }
-          } catch (e) {
-            console.error('Failed to read legacy local data', e);
+        // Check for data left over in this browser from before sign-in existed,
+        // regardless of whether a (possibly still-empty) cloud row already exists —
+        // an early login before this feature shipped can otherwise mask it forever.
+        try {
+          const legacyRaw = localStorage.getItem('control-centre-state');
+          if (legacyRaw) {
+            const legacyParsed = JSON.parse(legacyRaw);
+            const hasContent = legacyParsed && (
+              (legacyParsed.tasks && legacyParsed.tasks.length) ||
+              (legacyParsed.meetings && legacyParsed.meetings.length) ||
+              (legacyParsed.quickLinks && legacyParsed.quickLinks.length) ||
+              (legacyParsed.pendingMeetings && legacyParsed.pendingMeetings.length) ||
+              (legacyParsed.plannedMeetings && legacyParsed.plannedMeetings.length)
+            );
+            if (hasContent) setLegacyImport(legacyParsed);
           }
+        } catch (e) {
+          console.error('Failed to read legacy local data', e);
         }
       } catch (e) {
         console.error('Failed to load cloud data', e);
@@ -2481,9 +2490,23 @@ function App(){
 
   function importLegacyData(){
     if (!legacyImport) return;
-    applyLoadedData(legacyImport);
-    // The save effect (keyed on `loaded`/`session`) will push this to Supabase
-    // on the next tick since `loaded` is already true by the time this runs.
+    const mergeById = (existing, incoming) => {
+      const ids = new Set(existing.map(x => x.id));
+      return [...existing, ...(incoming || []).filter(x => !ids.has(x.id))];
+    };
+    setCategories(cs => {
+      const ids = new Set(cs.map(c => c.id));
+      return [...cs, ...((legacyImport.categories || []).filter(c => !ids.has(c.id)))];
+    });
+    setCategoryCounter(c => Math.max(c, legacyImport.categoryCounter || 0));
+    setTasks(ts => mergeById(ts, legacyImport.tasks));
+    setMeetings(ms => mergeById(ms, legacyImport.meetings));
+    setQuickLinks(qs => mergeById(qs, legacyImport.quickLinks));
+    setLinkTags(tags => Array.from(new Set([...tags, ...(legacyImport.linkTags || [])])));
+    setPendingMeetings(ps => mergeById(ps, legacyImport.pendingMeetings));
+    setPlannedMeetings(pm => mergeById(pm, legacyImport.plannedMeetings));
+    // The save effect (keyed on `loaded`/`session`) will push the merged result to
+    // Supabase automatically once these state updates land.
     localStorage.removeItem('control-centre-state');
     setLegacyImport(null);
   }
@@ -2564,8 +2587,8 @@ function App(){
     <div className="app">
       <header className="topbar">
         <div>
-          <p className="topbar__eyebrow">{greeting} &middot; Product Operations</p>
-          <h1 className="topbar__title">Control Centre</h1>
+          <p className="topbar__eyebrow">{greeting}</p>
+          <h1 className="topbar__title">{getFirstNameFromEmail(session.user.email)}'s Control Centre</h1>
         </div>
         <div className="topbar__right">
           <div>
