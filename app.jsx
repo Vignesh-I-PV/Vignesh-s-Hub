@@ -157,16 +157,71 @@ function needsReminder(pending, today){
   return daysUntil <= 2;
 }
 
+/* ---------- Time / duration pickers (15-minute steps) ---------- */
+const TIME_OPTIONS = (() => {
+  const out = [];
+  for (let h = 0; h < 24; h++){
+    for (let m = 0; m < 60; m += 15){
+      out.push(String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0'));
+    }
+  }
+  return out;
+})();
+
+const DURATION_OPTIONS = [15, 30, 45, 60, 90, 120, 180];
+
+function formatDuration(mins){
+  if (mins < 60) return `${mins} min`;
+  const h = mins / 60;
+  return `${Number.isInteger(h) ? h : h.toFixed(1)} hr`;
+}
+
+function TimeSelect({ value, onChange, title }){
+  return (
+    <select value={value || '09:00'} title={title} onChange={e => onChange(e.target.value)}>
+      {TIME_OPTIONS.map(t => <option key={t} value={t}>{t}</option>)}
+    </select>
+  );
+}
+
+function DurationSelect({ value, onChange, title }){
+  return (
+    <select value={value || 30} title={title} onChange={e => onChange(Number(e.target.value))}>
+      {DURATION_OPTIONS.map(d => <option key={d} value={d}>{formatDuration(d)}</option>)}
+    </select>
+  );
+}
+
+function minutesSinceMidnight(hhmm){
+  if (!hhmm) return 0;
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function getWorkingHours(workingHours, defaultWorkingHours, dateISO){
+  return (workingHours && workingHours[dateISO]) || defaultWorkingHours || { start: '09:00', end: '18:00' };
+}
+
+// Weighted completion for whichever tasks pass `filterFn` — the same shape powers both
+// the daily and weekly progress bars, just with a different scope of tasks passed in.
+function computeProgress(tasks, filterFn){
+  const relevant = tasks.filter(filterFn);
+  const totalWeight = relevant.reduce((sum, t) => sum + (t.weight || 1), 0);
+  const doneWeight = relevant.filter(t => t.status === 'done').reduce((sum, t) => sum + (t.weight || 1), 0);
+  const percent = totalWeight > 0 ? Math.round((doneWeight / totalWeight) * 100) : null;
+  return { percent, totalWeight, doneWeight, count: relevant.length };
+}
+
 function getSeedData(){
   return {
     categories: DEFAULT_CATEGORIES,
     categoryCounter: DEFAULT_CATEGORIES.length + 1,
     meetings: [],
     tasks: [
-      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, startDate: '', endDate: todayISO(), notes: '', link: '', closingRemark: '' },
-      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '' },
-      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '' },
-      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  startDate: '', endDate: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '' }
+      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, startDate: '', endDate: todayISO(), notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' },
+      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' },
+      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' },
+      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  startDate: '', endDate: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '', weight: 1, completedAt: '' }
     ],
     quickLinks: [
       { id: uid(), label: 'PRD Master Folder',    url: 'https://drive.google.com',  type: 'drive', tag: 'Masters' },
@@ -206,6 +261,7 @@ function DeadlineChip({ task, category, onClick, onFocusClick }){
 function FocusTimeModal({ task, onClose, onSave }){
   const [date, setDate] = useState(todayISO());
   const [time, setTime] = useState('10:00');
+  const [duration, setDuration] = useState(30);
 
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
@@ -231,13 +287,17 @@ function FocusTimeModal({ task, onClose, onSave }){
             <input type="date" value={date} onChange={e => setDate(e.target.value)} />
           </div>
           <div>
-            <label>Time</label>
-            <input type="time" value={time} onChange={e => setTime(e.target.value)} />
+            <label>Start time</label>
+            <TimeSelect value={time} onChange={setTime} />
+          </div>
+          <div>
+            <label>Duration</label>
+            <DurationSelect value={duration} onChange={setDuration} />
           </div>
         </div>
         <div className="modal-footer">
           <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn--amber" onClick={() => onSave(date, time)}>Add to calendar</button>
+          <button className="btn btn--amber" onClick={() => onSave(date, time, duration)}>Add to calendar</button>
         </div>
       </div>
     </div>
@@ -340,12 +400,13 @@ function AddMeetingForm({ open, onCancel, onSubmit }){
   const [type, setType] = useState('pod');
   const [weekday, setWeekday] = useState(0);
   const [time, setTime] = useState('10:00');
+  const [duration, setDuration] = useState(30);
   const [cadence, setCadence] = useState('weekly');
   const [parity, setParity] = useState('A');
 
   function submit(){
     if (!name.trim()) return;
-    onSubmit({ name: name.trim(), type, weekday: Number(weekday), time, cadence, parity });
+    onSubmit({ name: name.trim(), type, weekday: Number(weekday), time, duration, cadence, parity });
     setName('');
   }
 
@@ -371,8 +432,12 @@ function AddMeetingForm({ open, onCancel, onSubmit }){
         </select>
       </div>
       <div>
-        <label>Time</label>
-        <input type="time" value={time} onChange={e => setTime(e.target.value)} />
+        <label>Start time</label>
+        <TimeSelect value={time} onChange={setTime} />
+      </div>
+      <div>
+        <label>Duration</label>
+        <DurationSelect value={duration} onChange={setDuration} />
       </div>
       <div>
         <label>Cadence</label>
@@ -398,7 +463,7 @@ function AddMeetingForm({ open, onCancel, onSubmit }){
   );
 }
 
-function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, addOpen, setAddOpen, onAddMeeting }){
+function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting }){
   const monday = getMonday(new Date(Date.now() + weekOffset * 7 * 86400000));
   const parity = getParity(monday);
   const sunday = new Date(monday); sunday.setDate(sunday.getDate() + 6);
@@ -450,7 +515,7 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
                       return (
                         <div key={m.id} className="meeting-block" style={{ '--type-color': t.color }}>
                           <button className="meeting-block__del" title="Remove" onClick={() => onDeleteMeeting(m.id)}>&times;</button>
-                          <div className="meeting-block__time">{m.time}</div>
+                          <div className="meeting-block__time">{m.time} &middot; {formatDuration(m.duration || 30)}</div>
                           <div className="meeting-block__name">{m.name}</div>
                           <div className="meeting-block__foot">
                             <span className="pill" style={{ '--pill-color': t.color, '--pill-bg': t.dim }}>{t.label}</span>
@@ -464,12 +529,16 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
                       const color = isFocus ? 'var(--green)' : 'var(--purple)';
                       const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
                       return (
-                        <div key={m.id} className="meeting-block" style={{ '--type-color': color }}>
-                          <button className="meeting-block__del" title="Remove" onClick={() => onDeletePlanned(m.id)}>&times;</button>
-                          <div className="meeting-block__time">{m.time || '—'}</div>
+                        <div key={m.id} className="meeting-block" style={{ '--type-color': color, cursor: isFocus ? 'default' : 'pointer' }}
+                          onClick={() => { if (!isFocus) onOpenMeeting(m.id); }}>
+                          <button className="meeting-block__del" title="Remove" onClick={e => { e.stopPropagation(); onDeletePlanned(m.id); }}>&times;</button>
+                          <div className="meeting-block__time">{m.time || '—'} &middot; {formatDuration(m.duration || 30)}</div>
                           <div className="meeting-block__name">{m.title}</div>
                           <div className="meeting-block__foot">
                             <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>
+                            {!isFocus && (m.agenda || []).length > 0 && (
+                              <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.agenda.length} agenda</span>
+                            )}
                           </div>
                         </div>
                       );
@@ -536,12 +605,29 @@ function PendingMeetingsPanel({ items, onAdd, onUpdate, onDelete, onPromote }){
   const [title, setTitle] = useState('');
   const [targetDate, setTargetDate] = useState('');
   const [notes, setNotes] = useState('');
+  const [schedulingId, setSchedulingId] = useState(null);
+  const [schedDate, setSchedDate] = useState('');
+  const [schedTime, setSchedTime] = useState('09:00');
+  const [schedDuration, setSchedDuration] = useState(30);
   const today = todayISO();
 
   function submit(){
     if (!title.trim()) return;
     onAdd(title.trim(), targetDate, notes.trim());
     setTitle(''); setTargetDate(''); setNotes(''); setOpen(false);
+  }
+
+  function startScheduling(m){
+    setSchedulingId(m.id);
+    setSchedDate(m.targetDate || today);
+    setSchedTime('09:00');
+    setSchedDuration(30);
+  }
+
+  function confirmScheduling(){
+    if (!schedDate) return;
+    onPromote(schedulingId, schedDate, schedTime, schedDuration);
+    setSchedulingId(null);
   }
 
   return (
@@ -580,15 +666,37 @@ function PendingMeetingsPanel({ items, onAdd, onUpdate, onDelete, onPromote }){
           {items.map(m => {
             const remind = needsReminder(m, today);
             return (
-              <div key={m.id} className="pending-meeting-row">
-                <span className={`reminder-dot${remind ? ' due' : ''}`} title={remind ? 'Reminder: this still needs setting up' : 'No reminder due yet'} />
-                <input className="task-title" type="text" value={m.title} onChange={e => onUpdate(m.id, { title: e.target.value })} />
-                <input className="task-due" type="date" value={m.targetDate || ''} title="Target date (optional)"
-                  onChange={e => onUpdate(m.id, { targetDate: e.target.value })} />
-                <input className="task-notes-inline" type="text" placeholder="Notes" value={m.notes || ''}
-                  onChange={e => onUpdate(m.id, { notes: e.target.value })} />
-                <button className="btn btn--amber" onClick={() => onPromote(m.id)}>Schedule</button>
-                <button className="icon-btn" title="Delete" onClick={() => onDelete(m.id)}>&times;</button>
+              <div key={m.id}>
+                <div className="pending-meeting-row">
+                  <span className={`reminder-dot${remind ? ' due' : ''}`} title={remind ? 'Reminder: this still needs setting up' : 'No reminder due yet'} />
+                  <input className="task-title" type="text" value={m.title} onChange={e => onUpdate(m.id, { title: e.target.value })} />
+                  <input className="task-due" type="date" value={m.targetDate || ''} title="Target date (optional)"
+                    onChange={e => onUpdate(m.id, { targetDate: e.target.value })} />
+                  <input className="task-notes-inline" type="text" placeholder="Notes" value={m.notes || ''}
+                    onChange={e => onUpdate(m.id, { notes: e.target.value })} />
+                  <button className="btn btn--amber" onClick={() => startScheduling(m)}>Schedule</button>
+                  <button className="icon-btn" title="Delete" onClick={() => onDelete(m.id)}>&times;</button>
+                </div>
+                {schedulingId === m.id && (
+                  <div className="add-form open" style={{ marginTop: 6 }}>
+                    <div>
+                      <label>Date</label>
+                      <input type="date" value={schedDate} onChange={e => setSchedDate(e.target.value)} />
+                    </div>
+                    <div>
+                      <label>Start time</label>
+                      <TimeSelect value={schedTime} onChange={setSchedTime} />
+                    </div>
+                    <div>
+                      <label>Duration</label>
+                      <DurationSelect value={schedDuration} onChange={setSchedDuration} />
+                    </div>
+                    <div className="full">
+                      <button className="btn btn--ghost" onClick={() => setSchedulingId(null)}>Cancel</button>
+                      <button className="btn btn--amber" onClick={confirmScheduling}>Confirm schedule</button>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -633,29 +741,40 @@ function AgendaList({ agenda, onChange }){
   );
 }
 
-function PlannedMeetingCard({ meeting, onUpdate, onDelete }){
+function PlannedMeetingRow({ meeting, onOpen, onDelete }){
+  const agendaCount = (meeting.agenda || []).length;
+  const doneCount = (meeting.agenda || []).filter(a => a.done).length;
+  const typeMeta = MEETING_TYPES[meeting.type];
+  const color = meeting.type && typeMeta ? typeMeta.color : 'var(--purple)';
   return (
-    <div className="planned-meeting-card">
-      <div className="planned-meeting-card__head">
-        <input className="task-title" type="text" value={meeting.title} onChange={e => onUpdate({ title: e.target.value })} />
-        <input type="date" value={meeting.date || ''} title="Reschedule" onChange={e => onUpdate({ date: e.target.value })} />
-        <input type="time" value={meeting.time || ''} onChange={e => onUpdate({ time: e.target.value })} />
-        <button className="icon-btn" title="Delete meeting" onClick={onDelete}>&times;</button>
+    <div className="planned-meeting-row" style={{ '--type-color': color }} onClick={onOpen}>
+      <div className="planned-meeting-row__time">
+        <span>{meeting.date}</span>
+        <span>{meeting.time || '—'} &middot; {formatDuration(meeting.duration || 30)}</span>
       </div>
-      <AgendaList agenda={meeting.agenda} onChange={agenda => onUpdate({ agenda })} />
+      <div className="planned-meeting-row__title">{meeting.title}</div>
+      <div className="planned-meeting-row__meta">
+        {typeMeta && <span className="pill" style={{ '--pill-color': typeMeta.color, '--pill-bg': typeMeta.dim }}>{typeMeta.label}</span>}
+        {agendaCount > 0 && (
+          <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{doneCount}/{agendaCount} agenda</span>
+        )}
+      </div>
+      <button className="icon-btn" title="Delete meeting" onClick={e => { e.stopPropagation(); onDelete(); }}>&times;</button>
     </div>
   );
 }
 
-function PlannedMeetingsPanel({ items, onAdd, onUpdate, onDelete }){
+function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState('');
   const [date, setDate] = useState('');
   const [time, setTime] = useState('10:00');
+  const [duration, setDuration] = useState(30);
+  const [type, setType] = useState('other');
 
   function submit(){
     if (!title.trim() || !date) return;
-    onAdd(title.trim(), date, time);
+    onAdd(title.trim(), date, time, duration, type);
     setTitle(''); setDate(''); setOpen(false);
   }
 
@@ -677,12 +796,26 @@ function PlannedMeetingsPanel({ items, onAdd, onUpdate, onDelete }){
           <input type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g. Vendor kickoff call" />
         </div>
         <div>
+          <label>Type</label>
+          <select value={type} onChange={e => setType(e.target.value)}>
+            <option value="other">General</option>
+            <option value="pod">POD Connect</option>
+            <option value="mentor">Mentor Sync</option>
+            <option value="champion">Champion Review</option>
+            <option value="sprint">Sprint Call</option>
+          </select>
+        </div>
+        <div>
           <label>Date</label>
           <input type="date" value={date} onChange={e => setDate(e.target.value)} />
         </div>
         <div>
-          <label>Time</label>
-          <input type="time" value={time} onChange={e => setTime(e.target.value)} />
+          <label>Start time</label>
+          <TimeSelect value={time} onChange={setTime} />
+        </div>
+        <div>
+          <label>Duration</label>
+          <DurationSelect value={duration} onChange={setDuration} />
         </div>
         <div className="full">
           <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
@@ -695,8 +828,8 @@ function PlannedMeetingsPanel({ items, onAdd, onUpdate, onDelete }){
       ) : (
         <div className="planned-meetings">
           {sorted.map(m => (
-            <PlannedMeetingCard key={m.id} meeting={m}
-              onUpdate={patch => onUpdate(m.id, patch)}
+            <PlannedMeetingRow key={m.id} meeting={m}
+              onOpen={() => onOpen(m.id)}
               onDelete={() => onDelete(m.id)} />
           ))}
         </div>
@@ -705,6 +838,111 @@ function PlannedMeetingsPanel({ items, onAdd, onUpdate, onDelete }){
   );
 }
 
+
+function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onDelete }){
+  useEffect(() => {
+    function onKey(e){ if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  if (!meeting) return null;
+
+  const today = todayISO();
+  const isReviewType = meeting.type === 'mentor' || meeting.type === 'champion';
+
+  let suggestions = [];
+  if (isReviewType){
+    const atRisk = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length))));
+    const extended = tasks.filter(t => t.status !== 'done' && t.dueRevisions && t.dueRevisions.length > 0);
+    const recentlyDone = tasks.filter(t => {
+      if (t.status !== 'done' || !t.completedAt) return false;
+      const daysAgo = Math.round((new Date(today) - new Date(t.completedAt)) / 86400000);
+      return daysAgo >= 0 && daysAgo <= 7;
+    });
+    const existingAgendaText = (meeting.agenda || []).map(a => a.text);
+    const pack = (list, label) => list.map(t => {
+      const cat = categoryById(categories, t.theme);
+      return { taskId: t.id, text: `${t.title}${cat ? ` (${cat.code})` : ''} — ${label}` };
+    });
+    suggestions = [...pack(atRisk, 'at risk'), ...pack(extended, 'deadline extended'), ...pack(recentlyDone, 'completed this week')]
+      .filter(s => !existingAgendaText.includes(s.text))
+      .slice(0, 8);
+  }
+
+  function addSuggestion(text){
+    onUpdate({ agenda: [...(meeting.agenda || []), { id: uid(), text, done: false }] });
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">{MEETING_TYPES[meeting.type] ? MEETING_TYPES[meeting.type].label : 'Meeting'}</p>
+            <input className="modal-title-input" type="text" value={meeting.title} onChange={e => onUpdate({ title: e.target.value })} />
+          </div>
+          <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
+        </div>
+
+        <div className="modal-grid">
+          <div>
+            <label>Date</label>
+            <input type="date" value={meeting.date || ''} onChange={e => onUpdate({ date: e.target.value })} />
+          </div>
+          <div>
+            <label>Start time</label>
+            <TimeSelect value={meeting.time} onChange={time => onUpdate({ time })} />
+          </div>
+          <div>
+            <label>Duration</label>
+            <DurationSelect value={meeting.duration} onChange={duration => onUpdate({ duration })} />
+          </div>
+          <div>
+            <label>Type</label>
+            <select value={meeting.type || 'other'} onChange={e => onUpdate({ type: e.target.value })}>
+              <option value="other">General</option>
+              <option value="pod">POD Connect</option>
+              <option value="mentor">Mentor Sync</option>
+              <option value="champion">Champion Review</option>
+              <option value="sprint">Sprint Call</option>
+            </select>
+          </div>
+        </div>
+
+        {suggestions.length > 0 && (
+          <div className="modal-field">
+            <label>Suggested agenda items</label>
+            <div className="suggestion-list">
+              {suggestions.map((s, i) => (
+                <div key={i} className="suggestion-item">
+                  <span>{s.text}</span>
+                  <button className="btn" onClick={() => addSuggestion(s.text)}>+ Add</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="modal-field">
+          <label>Agenda &amp; action items</label>
+          <AgendaList agenda={meeting.agenda} onChange={agenda => onUpdate({ agenda })} />
+        </div>
+
+        <div className="modal-field">
+          <label>Notes</label>
+          <textarea className="modal-notes" rows={6} placeholder="Discussion notes, decisions, follow-ups…"
+            value={meeting.notes || ''} onChange={e => onUpdate({ notes: e.target.value })} />
+        </div>
+
+        <div className="modal-footer">
+          <button className="btn btn--danger" onClick={() => { onDelete(); onClose(); }}>Delete meeting</button>
+          <button className="btn btn--amber" onClick={onClose}>Done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteTag }){
   const [open, setOpen] = useState(false);
@@ -1015,7 +1253,10 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
           <div>
             <label>Status</label>
             <select value={task.status}
-              onChange={e => onUpdate({ status: e.target.value, atRisk: e.target.value === 'done' ? false : task.atRisk })}>
+              onChange={e => {
+                const val = e.target.value;
+                onUpdate({ status: val, atRisk: val === 'done' ? false : task.atRisk, completedAt: val === 'done' ? todayISO() : '' });
+              }}>
               <option value="todo">To do</option>
               <option value="progress">In progress</option>
               <option value="done">Done</option>
@@ -1035,6 +1276,11 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
               onClick={() => onUpdate({ atRisk: !task.atRisk })}>
               {task.atRisk ? '⚑ Flagged at risk' : 'Not flagged'}
             </button>
+          </div>
+          <div>
+            <label>Weight</label>
+            <input type="number" min="1" max="10" step="1" value={task.weight || 1}
+              onChange={e => onUpdate({ weight: Math.max(1, Number(e.target.value) || 1) })} />
           </div>
         </div>
 
@@ -1193,6 +1439,259 @@ function TaskListView({ tasks, categories, onUpdateTask, onSetTaskStatus, onTogg
   );
 }
 
+/* ============================== Progress, planning & digest ============================== */
+
+function ProgressBar({ percent, color }){
+  const pct = percent === null ? 0 : percent;
+  return (
+    <div className="progress-track">
+      <div className="progress-fill" style={{ width: `${pct}%`, background: color || 'var(--amber)' }} />
+    </div>
+  );
+}
+
+function ProgressPanel({ dailyProgress, weeklyProgress, timeElapsedPercent }){
+  const dailyColor = dailyProgress.percent === null ? 'var(--text-faint)'
+    : dailyProgress.percent >= timeElapsedPercent ? 'var(--green)'
+    : (timeElapsedPercent - dailyProgress.percent <= 15 ? 'var(--amber)' : 'var(--red)');
+
+  return (
+    <section className="panel">
+      <div className="panel__head" style={{ marginBottom: 12 }}>
+        <div>
+          <p className="panel__eyebrow">My Progress</p>
+          <h2 className="panel__title">Weighted task completion</h2>
+        </div>
+      </div>
+
+      <div className="progress-row">
+        <div className="progress-row__label">
+          <span>Today</span>
+          <span>{dailyProgress.percent === null ? 'No tasks today' : `${dailyProgress.percent}% complete`}</span>
+        </div>
+        <ProgressBar percent={dailyProgress.percent} color={dailyColor} />
+        <div className="progress-row__sub">
+          <span>Day elapsed: {timeElapsedPercent}%</span>
+          {dailyProgress.percent !== null && (
+            <span>{dailyProgress.percent >= timeElapsedPercent ? 'On pace' : 'Behind pace'}</span>
+          )}
+        </div>
+      </div>
+
+      <div className="progress-row">
+        <div className="progress-row__label">
+          <span>This Week</span>
+          <span>{weeklyProgress.percent === null ? 'No tasks this week' : `${weeklyProgress.percent}% complete`}</span>
+        </div>
+        <ProgressBar percent={weeklyProgress.percent} color="var(--cyan)" />
+      </div>
+    </section>
+  );
+}
+
+function WorkingHoursPanel({ workingHours, defaultWorkingHours, onSet }){
+  const [open, setOpen] = useState(false);
+  const [date, setDate] = useState(todayISO());
+  const [start, setStart] = useState(defaultWorkingHours.start);
+  const [end, setEnd] = useState(defaultWorkingHours.end);
+
+  function submit(){
+    onSet(date, { start, end });
+    setOpen(false);
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel__head">
+        <div>
+          <p className="panel__eyebrow">Working Hours</p>
+          <h2 className="panel__title">Today: {getWorkingHours(workingHours, defaultWorkingHours, todayISO()).start} &ndash; {getWorkingHours(workingHours, defaultWorkingHours, todayISO()).end}</h2>
+        </div>
+        <button className="btn" onClick={() => setOpen(o => !o)}>Set hours for a day</button>
+      </div>
+      <div className={`add-form${open ? ' open' : ''}`}>
+        <div>
+          <label>Date</label>
+          <input type="date" value={date} onChange={e => setDate(e.target.value)} />
+        </div>
+        <div>
+          <label>Start</label>
+          <TimeSelect value={start} onChange={setStart} />
+        </div>
+        <div>
+          <label>End</label>
+          <TimeSelect value={end} onChange={setEnd} />
+        </div>
+        <div className="full">
+          <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
+          <button className="btn btn--amber" onClick={submit}>Save</button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function DailyPlannerModal({ defaultWorkingHours, todayMeetings, todayTasks, categories, onAddTask, onAddMeeting, onClose }){
+  const [start, setStart] = useState(defaultWorkingHours.start);
+  const [end, setEnd] = useState(defaultWorkingHours.end);
+  const [taskTitle, setTaskTitle] = useState('');
+  const [taskCategory, setTaskCategory] = useState(categories[0] ? categories[0].id : '');
+  const [meetingTitle, setMeetingTitle] = useState('');
+  const [meetingTime, setMeetingTime] = useState('09:00');
+  const [meetingDuration, setMeetingDuration] = useState(30);
+
+  function addTaskQuick(){
+    if (!taskTitle.trim() || !taskCategory) return;
+    onAddTask(taskCategory, taskTitle.trim(), '', todayISO());
+    setTaskTitle('');
+  }
+  function addMeetingQuick(){
+    if (!meetingTitle.trim()) return;
+    onAddMeeting(meetingTitle.trim(), todayISO(), meetingTime, meetingDuration, 'other');
+    setMeetingTitle('');
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-panel">
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">Good morning</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>Set up today</div>
+          </div>
+        </div>
+
+        <div className="modal-field">
+          <label>Working hours for today</label>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <TimeSelect value={start} onChange={setStart} />
+            <span style={{ color: 'var(--text-faint)' }}>&rarr;</span>
+            <TimeSelect value={end} onChange={setEnd} />
+          </div>
+        </div>
+
+        <div className="modal-field">
+          <label>Already on the books today</label>
+          {todayMeetings.length === 0 && todayTasks.length === 0 ? (
+            <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>Nothing yet — add below if you know what's coming.</p>
+          ) : (
+            <div className="today-list">
+              {todayMeetings.map(m => (
+                <div key={m.id} className="today-item" style={{ cursor: 'default' }}>
+                  <span className="today-item__time">{m.time || m.time === 0 ? m.time : '—'}</span>
+                  <span className="today-item__title">{m.name || m.title}</span>
+                </div>
+              ))}
+              {todayTasks.map(t => (
+                <div key={t.id} className="today-item" style={{ cursor: 'default' }}>
+                  <span className="today-item__title">{t.title}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="modal-field">
+          <label>Quick-add a task for today</label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <input type="text" placeholder="What needs to get done?" value={taskTitle}
+              onChange={e => setTaskTitle(e.target.value)} style={{ flex: '2 1 200px' }}
+              onKeyDown={e => { if (e.key === 'Enter') addTaskQuick(); }} />
+            <select value={taskCategory} onChange={e => setTaskCategory(e.target.value)} style={{ flex: '1 1 140px' }}>
+              {categories.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
+            </select>
+            <button className="btn btn--amber" onClick={addTaskQuick}>Add</button>
+          </div>
+        </div>
+
+        <div className="modal-field">
+          <label>Quick-add a meeting for today</label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <input type="text" placeholder="Meeting title" value={meetingTitle}
+              onChange={e => setMeetingTitle(e.target.value)} style={{ flex: '2 1 200px' }} />
+            <TimeSelect value={meetingTime} onChange={setMeetingTime} />
+            <DurationSelect value={meetingDuration} onChange={setMeetingDuration} />
+            <button className="btn btn--amber" onClick={addMeetingQuick}>Add</button>
+          </div>
+        </div>
+
+        <div className="modal-footer">
+          <button className="btn btn--amber" onClick={() => onClose({ start, end })}>Start my day</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WeeklyDigestModal({ weekLabel, categories, tasks, onClose }){
+  const today = todayISO();
+  const realMonday = getMonday(new Date());
+  const weekStart = isoOf(realMonday);
+  const realSunday = new Date(realMonday); realSunday.setDate(realSunday.getDate() + 6);
+  const weekEnd = isoOf(realSunday);
+
+  const completed = tasks.filter(t => t.status === 'done' && t.completedAt && t.completedAt >= weekStart && t.completedAt <= weekEnd);
+  const stillOpen = tasks.filter(t => t.status !== 'done' && taskMatchesRange(t, weekStart, weekEnd));
+  const extended = stillOpen.filter(t => t.dueRevisions && t.dueRevisions.length > 0);
+  const atRisk = stillOpen.filter(t => t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length)));
+  const progress = computeProgress(tasks, t => taskMatchesRange(t, weekStart, weekEnd));
+
+  function section(title, list, color){
+    if (list.length === 0) return null;
+    return (
+      <div className="modal-field">
+        <label style={{ color }}>{title} ({list.length})</label>
+        <div className="digest-list">
+          {list.map(t => {
+            const cat = categoryById(categories, t.theme);
+            return (
+              <div key={t.id} className="digest-item">
+                <span className="digest-item__code">{cat ? cat.code : '—'}</span>
+                <span>{t.title}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">Weekly Digest</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>{weekLabel}</div>
+          </div>
+          <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
+        </div>
+
+        <div className="modal-field">
+          <label>Week progress</label>
+          <ProgressBar percent={progress.percent} color="var(--cyan)" />
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginTop: 6 }}>
+            {progress.percent === null ? 'No tasks tracked this week.' : `${progress.percent}% of this week's weighted workload complete.`}
+          </p>
+        </div>
+
+        {section('Completed this week', completed, 'var(--green)')}
+        {section('Still open', stillOpen, 'var(--text-lo)')}
+        {section('Extended', extended, 'var(--purple)')}
+        {section('At risk', atRisk, 'var(--red)')}
+
+        {completed.length === 0 && stillOpen.length === 0 && (
+          <p className="task-empty">Nothing tracked for this week yet.</p>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn btn--amber" onClick={onClose} style={{ marginLeft: 'auto' }}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ============================== App ============================== */
 
 function App(){
@@ -1213,9 +1712,18 @@ function App(){
   const [activeTab, setActiveTab] = useState('overview');
   const [detailTaskId, setDetailTaskId] = useState(null);
   const [focusTaskId, setFocusTaskId] = useState(null);
+  const [meetingDetailId, setMeetingDetailId] = useState(null);
+  const [workingHours, setWorkingHours] = useState({});
+  const [defaultWorkingHours, setDefaultWorkingHours] = useState({ start: '09:00', end: '18:00' });
+  const [lastVisitDate, setLastVisitDate] = useState('');
+  const [lastDigestWeek, setLastDigestWeek] = useState('');
+  const [dailyPlannerOpen, setDailyPlannerOpen] = useState(false);
+  const [digestOpen, setDigestOpen] = useState(false);
 
   // Load once on mount
   useEffect(() => {
+    let resumedLastVisit = '';
+    let resumedDigestWeek = '';
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
@@ -1232,6 +1740,12 @@ function App(){
         setPendingMeetings(parsed.pendingMeetings || []);
         setPlannedMeetings(parsed.plannedMeetings || []);
         setSettings(Object.assign({ calendarEmbedUrl: '' }, parsed.settings || {}));
+        setWorkingHours(parsed.workingHours || {});
+        setDefaultWorkingHours(parsed.defaultWorkingHours || { start: '09:00', end: '18:00' });
+        resumedLastVisit = parsed.lastVisitDate || '';
+        resumedDigestWeek = parsed.lastDigestWeek || '';
+        setLastVisitDate(resumedLastVisit);
+        setLastDigestWeek(resumedDigestWeek);
       } else {
         const seed = getSeedData();
         setCategories(seed.categories);
@@ -1246,6 +1760,13 @@ function App(){
     } catch (e) {
       console.error('Failed to load saved data', e);
     }
+
+    const today = todayISO();
+    if (resumedLastVisit !== today) setDailyPlannerOpen(true);
+    const isFriday = new Date().getDay() === 5;
+    const mondayIso = isoOf(getMonday(new Date()));
+    if (isFriday && resumedDigestWeek !== mondayIso) setDigestOpen(true);
+
     setLoaded(true);
   }, []);
 
@@ -1253,14 +1774,18 @@ function App(){
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        categories, categoryCounter, meetings, tasks, quickLinks, linkTags,
+        pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours,
+        lastVisitDate, lastDigestWeek
+      }));
       setSaved(true);
       const t = setTimeout(() => setSaved(false), 900);
       return () => clearTimeout(t);
     } catch (e) {
       console.error('Failed to save data', e);
     }
-  }, [categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, loaded]);
+  }, [categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, loaded]);
 
   // Clock
   useEffect(() => {
@@ -1282,7 +1807,7 @@ function App(){
 
   /* ---------- Task actions ---------- */
   function addTask(categoryId, title, startDate, endDate){
-    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: startDate || '', endDate: endDate || '', notes: '', link: '', closingRemark: '' }]);
+    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: startDate || '', endDate: endDate || '', notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' }]);
   }
   function updateTask(id, patch){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, ...patch } : t)));
@@ -1291,7 +1816,9 @@ function App(){
     setTasks(ts => ts.filter(t => t.id !== id));
   }
   function setTaskStatus(id, status){
-    setTasks(ts => ts.map(t => (t.id === id ? { ...t, status, atRisk: status === 'done' ? false : t.atRisk } : t)));
+    setTasks(ts => ts.map(t => (t.id === id
+      ? { ...t, status, atRisk: status === 'done' ? false : t.atRisk, completedAt: status === 'done' ? todayISO() : '' }
+      : t)));
   }
   function toggleRisk(id){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, atRisk: !t.atRisk } : t)));
@@ -1306,8 +1833,8 @@ function App(){
       return { ...t, endDate: newDue };
     }));
   }
-  function addFocusBlock(taskId, taskTitle, date, time){
-    setPlannedMeetings(pm => [...pm, { id: uid(), title: `Focus: ${taskTitle}`, date, time, agenda: [], notes: '', kind: 'focus', taskId }]);
+  function addFocusBlock(taskId, taskTitle, date, time, duration){
+    setPlannedMeetings(pm => [...pm, { id: uid(), title: `Focus: ${taskTitle}`, date, time, duration: duration || 30, agenda: [], notes: '', kind: 'focus', taskId }]);
   }
   function goToTask(id){
     setActiveTab('tasks');
@@ -1348,20 +1875,37 @@ function App(){
   function deletePendingMeeting(id){
     setPendingMeetings(ps => ps.filter(p => p.id !== id));
   }
-  function promotePendingMeeting(id){
+  function promotePendingMeeting(id, date, time, duration){
     const m = pendingMeetings.find(p => p.id === id);
     if (!m) return;
     setPendingMeetings(ps => ps.filter(p => p.id !== id));
-    setPlannedMeetings(pm => [...pm, { id: uid(), title: m.title, date: m.targetDate || todayISO(), time: '10:00', agenda: [], notes: m.notes || '', kind: 'meeting' }]);
+    setPlannedMeetings(pm => [...pm, {
+      id: uid(), title: m.title, date: date || m.targetDate || todayISO(), time: time || '09:00',
+      duration: duration || 30, agenda: [], notes: m.notes || '', kind: 'meeting', type: 'other'
+    }]);
   }
-  function addPlannedMeeting(title, date, time){
-    setPlannedMeetings(pm => [...pm, { id: uid(), title, date, time, agenda: [], notes: '', kind: 'meeting' }]);
+  function addPlannedMeeting(title, date, time, duration, type){
+    setPlannedMeetings(pm => [...pm, { id: uid(), title, date, time, duration: duration || 30, type: type || 'other', agenda: [], notes: '', kind: 'meeting' }]);
   }
   function updatePlannedMeeting(id, patch){
     setPlannedMeetings(pm => pm.map(p => (p.id === id ? { ...p, ...patch } : p)));
   }
   function deletePlannedMeeting(id){
     setPlannedMeetings(pm => pm.filter(p => p.id !== id));
+  }
+
+  /* ---------- Working hours / daily planner / weekly digest ---------- */
+  function setWorkingHoursForDate(dateISO, hours){
+    setWorkingHours(wh => ({ ...wh, [dateISO]: hours }));
+  }
+  function closeDailyPlanner(todayHours){
+    if (todayHours) setWorkingHoursForDate(todayISO(), todayHours);
+    setLastVisitDate(todayISO());
+    setDailyPlannerOpen(false);
+  }
+  function closeDigest(){
+    if (new Date().getDay() === 5) setLastDigestWeek(isoOf(getMonday(new Date())));
+    setDigestOpen(false);
   }
 
   /* ---------- Derived stats ---------- */
@@ -1381,6 +1925,20 @@ function App(){
     .filter(x => x.diff <= 3)
     .sort((a, b) => a.diff - b.diff)
     .map(x => x.t);
+
+  const weekStartIso = isoOf(realMonday);
+  const realSunday = new Date(realMonday); realSunday.setDate(realSunday.getDate() + 6);
+  const weekEndIso = isoOf(realSunday);
+
+  const dailyProgress = computeProgress(tasks, t => taskAppearsOn(t, today));
+  const weeklyProgress = computeProgress(tasks, t => taskMatchesRange(t, weekStartIso, weekEndIso));
+
+  const todayHours = getWorkingHours(workingHours, defaultWorkingHours, today);
+  const startMin = minutesSinceMidnight(todayHours.start);
+  const endMin = minutesSinceMidnight(todayHours.end);
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const windowMin = Math.max(endMin - startMin, 1);
+  const timeElapsedPercent = Math.max(0, Math.min(100, Math.round(((nowMin - startMin) / windowMin) * 100)));
 
   return (
     <div className="app">
@@ -1417,6 +1975,8 @@ function App(){
             <StatChip label="Tasks done" value={doneCount} tone="green" onClick={() => setActiveTab('tasks')} />
           </section>
 
+          <ProgressPanel dailyProgress={dailyProgress} weeklyProgress={weeklyProgress} timeElapsedPercent={timeElapsedPercent} />
+
           {upcomingDeadlines.length > 0 && (
             <section className="panel deadlines-panel">
               <div className="panel__head" style={{ marginBottom: 8 }}>
@@ -1447,11 +2007,20 @@ function App(){
               onClickTask={goToTask}
             />
           </div>
+
+          <section className="panel" style={{ textAlign: 'center' }}>
+            <button className="btn" onClick={() => setDigestOpen(true)}>View this week's digest</button>
+          </section>
         </React.Fragment>
       )}
 
       {activeTab === 'calendar' && (
         <React.Fragment>
+          <WorkingHoursPanel
+            workingHours={workingHours}
+            defaultWorkingHours={defaultWorkingHours}
+            onSet={setWorkingHoursForDate}
+          />
           <PendingMeetingsPanel
             items={pendingMeetings}
             onAdd={addPendingMeeting}
@@ -1462,7 +2031,7 @@ function App(){
           <PlannedMeetingsPanel
             items={plannedMeetings.filter(m => m.kind !== 'focus')}
             onAdd={addPlannedMeeting}
-            onUpdate={updatePlannedMeeting}
+            onOpen={setMeetingDetailId}
             onDelete={deletePlannedMeeting}
           />
           <ScheduleBoard
@@ -1473,6 +2042,7 @@ function App(){
             setWeekOffset={setWeekOffset}
             onDeleteMeeting={deleteMeeting}
             onDeletePlanned={deletePlannedMeeting}
+            onOpenMeeting={setMeetingDetailId}
             addOpen={addMeetingOpen}
             setAddOpen={setAddMeetingOpen}
             onAddMeeting={addMeeting}
@@ -1533,11 +2103,46 @@ function App(){
         <FocusTimeModal
           task={tasks.find(t => t.id === focusTaskId)}
           onClose={() => setFocusTaskId(null)}
-          onSave={(date, time) => {
+          onSave={(date, time, duration) => {
             const t = tasks.find(x => x.id === focusTaskId);
-            if (t) addFocusBlock(focusTaskId, t.title, date, time);
+            if (t) addFocusBlock(focusTaskId, t.title, date, time, duration);
             setFocusTaskId(null);
           }}
+        />
+      )}
+
+      {meetingDetailId && (
+        <MeetingDetailModal
+          meeting={plannedMeetings.find(m => m.id === meetingDetailId)}
+          tasks={tasks}
+          categories={categories}
+          onClose={() => setMeetingDetailId(null)}
+          onUpdate={patch => updatePlannedMeeting(meetingDetailId, patch)}
+          onDelete={() => deletePlannedMeeting(meetingDetailId)}
+        />
+      )}
+
+      {dailyPlannerOpen && (
+        <DailyPlannerModal
+          defaultWorkingHours={getWorkingHours(workingHours, defaultWorkingHours, today)}
+          todayMeetings={[
+            ...meetings.filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity)),
+            ...plannedMeetings.filter(m => m.date === today)
+          ]}
+          todayTasks={tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today))}
+          categories={categories}
+          onAddTask={addTask}
+          onAddMeeting={addPlannedMeeting}
+          onClose={hours => closeDailyPlanner(hours)}
+        />
+      )}
+
+      {digestOpen && (
+        <WeeklyDigestModal
+          weekLabel={`Week of ${realMonday.getDate()} ${MONTHS[realMonday.getMonth()]}`}
+          categories={categories}
+          tasks={tasks}
+          onClose={closeDigest}
         />
       )}
 
