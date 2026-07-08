@@ -342,16 +342,8 @@ function getSeedData(){
     categories: DEFAULT_CATEGORIES,
     categoryCounter: DEFAULT_CATEGORIES.length + 1,
     meetings: [],
-    tasks: [
-      { id: uid(), theme: 'discovery', title: 'Draft discovery script for pricing flow', status: 'progress', atRisk: false, startDate: '', endDate: todayISO(), notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] },
-      { id: uid(), theme: 'docs',      title: 'PRD: checkout revamp v2',                 status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] },
-      { id: uid(), theme: 'proto',     title: 'Clickable prototype for onboarding v3',   status: 'todo',     atRisk: false, startDate: '', endDate: '',         notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] },
-      { id: uid(), theme: 'testing',   title: 'UAT sign-off for release 4.2',            status: 'progress', atRisk: true,  startDate: '', endDate: todayISO(), notes: 'Blocked on data pipeline fix', link: '', closingRemark: '', weight: 1, completedAt: '', subtasks: [] }
-    ],
-    quickLinks: [
-      { id: uid(), label: 'PRD Master Folder',    url: 'https://drive.google.com',  type: 'drive', tag: 'Masters' },
-      { id: uid(), label: 'Sprint Tracker Sheet', url: 'https://sheets.google.com', type: 'sheet', tag: 'Quick Access' }
-    ],
+    tasks: [],
+    quickLinks: [],
     linkTags: DEFAULT_LINK_TAGS,
     pendingMeetings: [],
     plannedMeetings: []
@@ -424,6 +416,46 @@ function EndOfDayModal({ notes, onClose }){
         </div>
         <div className="modal-footer">
           <button className="btn btn--amber" onClick={onClose} style={{ marginLeft: 'auto' }}>Got it</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LegacyImportModal({ data, onImport, onDiscard }){
+  const counts = [
+    ['task', (data.tasks || []).length],
+    ['meeting', (data.meetings || []).length],
+    ['quick link', (data.quickLinks || []).length],
+    ['meeting to set up', (data.pendingMeetings || []).length],
+    ['scheduled meeting', (data.plannedMeetings || []).length]
+  ].filter(([, n]) => n > 0);
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal-panel" style={{ maxWidth: 460 }}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">Found something</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 19, fontWeight: 700 }}>Bring in your earlier data?</div>
+          </div>
+        </div>
+        <div className="modal-field">
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-lo)', marginBottom: 10, lineHeight: 1.6 }}>
+            This browser has data saved from before sign-in was added:
+          </p>
+          <div className="digest-list">
+            {counts.map(([label, n]) => (
+              <div key={label} className="digest-item"><span>{n} {label}{n === 1 ? '' : 's'}</span></div>
+            ))}
+          </div>
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-faint)', marginTop: 10 }}>
+            Import moves it into your signed-in account (one-time). Discard clears it from this browser for good.
+          </p>
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn--ghost" onClick={onDiscard}>Discard</button>
+          <button className="btn btn--amber" onClick={onImport}>Import into my account</button>
         </div>
       </div>
     </div>
@@ -1093,7 +1125,7 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
       </div>
 
       {sorted.length === 0 ? (
-        <p className="task-empty">No meetings scheduled yet.</p>
+        <p className="task-empty">No meetings scheduled yet — add one above, or promote something from "To Be Set Up".</p>
       ) : (
         <div className="planned-meetings">
           {sorted.map(m => (
@@ -1723,7 +1755,7 @@ function TaskListView({ tasks, categories, onUpdateTask, onSetTaskStatus, onTogg
       </div>
 
       {filtered.length === 0 ? (
-        <p className="task-empty" style={{ padding: '20px 0' }}>No tasks in this view.</p>
+        <p className="task-empty" style={{ padding: '20px 0' }}>Nothing here yet — try Quick Add above to log your first task.</p>
       ) : STATUS_ORDER.map(statusId => {
         const statusTasks = filtered.filter(t => t.status === statusId);
         if (statusTasks.length === 0) return null;
@@ -2148,6 +2180,7 @@ function App(){
   const [stickyNotes, setStickyNotes] = useState([]);
   const [lastEodPromptDate, setLastEodPromptDate] = useState('');
   const [eodModalOpen, setEodModalOpen] = useState(false);
+  const [legacyImport, setLegacyImport] = useState(null);
   const saveTimer = useRef(null);
 
   // Check for an existing session on load, and keep listening for sign-in/out.
@@ -2213,6 +2246,25 @@ function App(){
           setLinkTags(seed.linkTags);
           setPendingMeetings(seed.pendingMeetings);
           setPlannedMeetings(seed.plannedMeetings);
+
+          // No cloud data yet for this account — check whether this browser has
+          // data left over from before sign-in was added, and offer to bring it in.
+          try {
+            const legacyRaw = localStorage.getItem('control-centre-state');
+            if (legacyRaw) {
+              const legacyParsed = JSON.parse(legacyRaw);
+              const hasContent = legacyParsed && (
+                (legacyParsed.tasks && legacyParsed.tasks.length) ||
+                (legacyParsed.meetings && legacyParsed.meetings.length) ||
+                (legacyParsed.quickLinks && legacyParsed.quickLinks.length) ||
+                (legacyParsed.pendingMeetings && legacyParsed.pendingMeetings.length) ||
+                (legacyParsed.plannedMeetings && legacyParsed.plannedMeetings.length)
+              );
+              if (hasContent) setLegacyImport(legacyParsed);
+            }
+          } catch (e) {
+            console.error('Failed to read legacy local data', e);
+          }
         }
       } catch (e) {
         console.error('Failed to load cloud data', e);
@@ -2425,6 +2477,19 @@ function App(){
   function closeEodModal(){
     setLastEodPromptDate(todayISO());
     setEodModalOpen(false);
+  }
+
+  function importLegacyData(){
+    if (!legacyImport) return;
+    applyLoadedData(legacyImport);
+    // The save effect (keyed on `loaded`/`session`) will push this to Supabase
+    // on the next tick since `loaded` is already true by the time this runs.
+    localStorage.removeItem('control-centre-state');
+    setLegacyImport(null);
+  }
+  function discardLegacyData(){
+    localStorage.removeItem('control-centre-state');
+    setLegacyImport(null);
   }
 
   /* ---------- Sub-tasks ---------- */
@@ -2695,7 +2760,7 @@ function App(){
         />
       )}
 
-      {dailyPlannerOpen && (
+      {dailyPlannerOpen && !legacyImport && (
         <DailyPlannerModal
           defaultWorkingHours={getWorkingHours(workingHours, defaultWorkingHours, today)}
           todayMeetings={[
@@ -2723,6 +2788,10 @@ function App(){
 
       {eodModalOpen && (
         <EndOfDayModal notes={stickyNotes} onClose={closeEodModal} />
+      )}
+
+      {legacyImport && (
+        <LegacyImportModal data={legacyImport} onImport={importLegacyData} onDiscard={discardLegacyData} />
       )}
 
       <p className="footnote">Synced to your account, private to {session.user.email} · a connected Google Calendar embed is only as private as your calendar's own sharing settings</p>
