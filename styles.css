@@ -234,9 +234,11 @@ body{
 
 /* ---------- Meeting invites: planned/scheduled + agenda ---------- */
 .planned-meetings{display:flex; flex-direction:column; gap:12px;}
-.planned-meeting-card{background:var(--ink-800); border:1px solid var(--line); border-radius:9px; padding:12px;}
-.planned-meeting-card__head{display:grid; grid-template-columns:1fr auto auto auto; align-items:center; gap:8px; margin-bottom:10px; padding-bottom:10px; border-bottom:1px dashed var(--line);}
-.planned-meeting-card__head input[type=date], .planned-meeting-card__head input[type=time]{background:var(--ink-900); border:1px solid var(--line); border-radius:5px; color:var(--text-lo); font-family:var(--font-mono); font-size:11px; padding:5px 6px;}
+.planned-meeting-row{display:grid; grid-template-columns:auto 1fr auto auto; align-items:center; gap:10px; background:var(--ink-800); border:1px solid var(--line); border-left:3px solid var(--type-color,var(--purple)); border-radius:8px; padding:9px 12px; cursor:pointer;}
+.planned-meeting-row:hover{border-color:var(--amber);}
+.planned-meeting-row__time{display:flex; flex-direction:column; font-family:var(--font-mono); font-size:11px; color:var(--text-lo); gap:2px; min-width:110px;}
+.planned-meeting-row__title{font-family:var(--font-body); font-size:13px; color:var(--text-hi);}
+.planned-meeting-row__meta{display:flex; gap:6px; flex-wrap:wrap;}
 .agenda-list{display:flex; flex-direction:column; gap:6px;}
 .agenda-item{display:flex; align-items:center; gap:8px; font-size:13px;}
 .agenda-item input[type=checkbox]{accent-color:var(--amber); width:14px; height:14px; flex-shrink:0;}
@@ -250,6 +252,23 @@ body{
 .theme-card__add input[type=date]{width:118px; background:var(--ink-800); border:1px solid var(--line); border-radius:6px; color:var(--text-lo); font-family:var(--font-mono); font-size:11px; padding:7px 6px;}
 
 .footnote{font-family:var(--font-mono); font-size:10px; color:var(--text-faint); text-align:center; margin-top:8px; letter-spacing:.04em;}
+
+/* ---------- Progress bars (My Progress panel + digest) ---------- */
+.progress-row{margin-bottom:16px;}
+.progress-row:last-child{margin-bottom:0;}
+.progress-row__label{display:flex; justify-content:space-between; font-family:var(--font-body); font-size:13px; color:var(--text-hi); margin-bottom:6px;}
+.progress-row__sub{display:flex; justify-content:space-between; font-family:var(--font-mono); font-size:10px; color:var(--text-lo); margin-top:5px; text-transform:uppercase; letter-spacing:.04em;}
+.progress-track{width:100%; height:10px; background:var(--ink-800); border:1px solid var(--line); border-radius:20px; overflow:hidden;}
+.progress-fill{height:100%; border-radius:20px; transition:width .3s ease;}
+
+/* ---------- Suggested agenda items (meeting detail modal) ---------- */
+.suggestion-list{display:flex; flex-direction:column; gap:6px;}
+.suggestion-item{display:flex; justify-content:space-between; align-items:center; gap:10px; background:var(--ink-800); border:1px dashed var(--line); border-radius:6px; padding:6px 10px; font-size:12px; color:var(--text-lo);}
+
+/* ---------- Weekly digest ---------- */
+.digest-list{display:flex; flex-direction:column; gap:5px;}
+.digest-item{display:flex; align-items:center; gap:8px; background:var(--ink-800); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font-size:12px; color:var(--text-hi);}
+.digest-item__code{font-family:var(--font-mono); font-size:9px; color:var(--text-faint); letter-spacing:.05em; min-width:44px;}
 
 ::-webkit-scrollbar{width:8px; height:8px;}
 ::-webkit-scrollbar-thumb{background:var(--ink-700); border-radius:8px;}
