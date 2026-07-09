@@ -100,6 +100,54 @@ const DOC_TYPE_META = {
   other: { label: 'Other links',   icon: '🔗' }
 };
 
+/* ---------- Google Calendar sync (read-only, via Edge Function) ---------- */
+
+// Bulleted or numbered lines in an event description become agenda-point
+// suggestions automatically — e.g. "- Review budget" or "1. Confirm scope".
+function detectAgendaFromDescription(desc){
+  if (!desc) return [];
+  const bulletRe = /^\s*(?:[-*\u2022]|\d+[.)])\s+(.+)/;
+  const items = [];
+  desc.split(/\r?\n/).forEach(line => {
+    const m = line.match(bulletRe);
+    if (m && m[1] && m[1].trim()) {
+      items.push({ id: uid(), text: m[1].trim(), done: false });
+    }
+  });
+  return items;
+}
+
+// Reshapes a raw event from the Edge Function into the same shape our own
+// plannedMeetings use, so the rest of the app (schedule grid, Today card,
+// prep-task reminders) can treat both uniformly with minimal special-casing.
+function normalizeGoogleEvent(ev){
+  const start = new Date(ev.start);
+  const end = ev.end ? new Date(ev.end) : new Date(start.getTime() + 30 * 60000);
+  const durationMin = Math.max(15, Math.round((end - start) / 60000));
+  return {
+    id: `google-${ev.id}`,
+    title: ev.title,
+    date: isoOf(start),
+    time: `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}`,
+    duration: durationMin,
+    kind: 'google',
+    description: ev.description || '',
+    url: ev.url || '',
+    agenda: detectAgendaFromDescription(ev.description || '')
+  };
+}
+
+async function fetchGoogleCalendarEvents(accessToken){
+  if (!supabaseClient || !window.SUPABASE_CONFIG) throw new Error('Supabase not configured');
+  const res = await fetch(`${window.SUPABASE_CONFIG.url}/functions/v1/fetch-google-calendar`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || `Sync failed (HTTP ${res.status})`);
+  return body;
+}
+
 function detectDocType(url){
   const u = (url || '').toLowerCase();
   if (u.includes('docs.google.com/document')) return 'doc';
@@ -334,6 +382,27 @@ function computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, monday,
 }
 
 /* ---------- A little personality ---------- */
+/* ---------- Browser notifications ---------- */
+async function notify(title, body){
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  try {
+    if (navigator.serviceWorker) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) {
+        reg.showNotification(title, { body, icon: undefined, tag: title });
+        return;
+      }
+    }
+  } catch (e) {
+    console.error('Service worker notification failed, falling back', e);
+  }
+  try {
+    new Notification(title, { body });
+  } catch (e) {
+    console.error('Notification failed', e);
+  }
+}
+
 function getFirstNameFromEmail(email){
   if (!email) return 'Your';
   const local = (email.split('@')[0] || '').trim();
@@ -567,14 +636,15 @@ function FocusTimeModal({ task, onClose, onSave }){
   );
 }
 
-function TodayMeetingsCard({ meetings, plannedMeetings, pendingMeetings, todayIdx, realParity, onClickMeeting }){
+function TodayMeetingsCard({ meetings, plannedMeetings, googleEvents, pendingMeetings, todayIdx, realParity, onClickMeeting }){
   const today = todayISO();
   const todayRecurring = meetings
     .filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity))
     .sort((a, b) => a.time.localeCompare(b.time));
   const todayPlanned = plannedMeetings.filter(m => m.date === today).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+  const todayGoogle = (googleEvents || []).filter(m => m.date === today).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
   const todayReminders = pendingMeetings.filter(m => needsReminder(m, today));
-  const nothing = todayRecurring.length === 0 && todayPlanned.length === 0 && todayReminders.length === 0;
+  const nothing = todayRecurring.length === 0 && todayPlanned.length === 0 && todayGoogle.length === 0 && todayReminders.length === 0;
 
   return (
     <section className="panel">
@@ -609,6 +679,16 @@ function TodayMeetingsCard({ meetings, plannedMeetings, pendingMeetings, todayId
                 <span className="today-item__time">{m.time || '—'}</span>
                 <span className="today-item__title">{m.title}</span>
                 {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>}
+              </div>
+            );
+          })}
+          {todayGoogle.map(m => {
+            const status = getMeetingStatus(today, m.time, m.duration);
+            return (
+              <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': 'var(--cyan)' }} onClick={onClickMeeting}>
+                <span className="today-item__time">{m.time}</span>
+                <span className="today-item__title">{m.title}</span>
+                {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': 'var(--cyan)', '--pill-bg': 'var(--cyan-dim)' }}>&#128197; Google</span>}
               </div>
             );
           })}
@@ -777,7 +857,7 @@ function DayHoursPanel({ iso, workingHours, defaultWorkingHours, oooRanges, onSe
   );
 }
 
-function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting, workingHours, defaultWorkingHours, oooRanges, onSetWorkingHours, onToggleFullDayOOO, onAddOOOBlock, onDeleteOOOBlock }){
+function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvents, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting, workingHours, defaultWorkingHours, oooRanges, onSetWorkingHours, onToggleFullDayOOO, onAddOOOBlock, onDeleteOOOBlock }){
   const monday = getMonday(new Date(Date.now() + weekOffset * 7 * 86400000));
   const parity = getParity(monday);
   const sunday = new Date(monday); sunday.setDate(sunday.getDate() + 6);
@@ -817,8 +897,9 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
           const iso = isoOf(d);
           const dayMeetings = meetingsForDay(i);
           const dayPlanned = plannedMeetings.filter(m => m.date === iso).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+          const dayGoogle = (googleEvents || []).filter(m => m.date === iso).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
           const dayPlaceholders = pendingMeetings.filter(m => m.targetDate === iso);
-          const hasAnything = dayMeetings.length > 0 || dayPlanned.length > 0 || dayPlaceholders.length > 0;
+          const hasAnything = dayMeetings.length > 0 || dayPlanned.length > 0 || dayGoogle.length > 0 || dayPlaceholders.length > 0;
           const dayOoo = oooRanges[iso];
           return (
             <div key={i} className={`schedule-day${isToday ? ' is-today' : ''}`}>
@@ -878,6 +959,22 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
                         </div>
                       );
                     })}
+                    {dayGoogle.map(m => {
+                      const status = getMeetingStatus(iso, m.time, m.duration);
+                      return (
+                        <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': 'var(--cyan)', cursor: 'pointer' }}
+                          onClick={() => onOpenMeeting(m.id)}>
+                          <div className="meeting-block__time">{m.time} &middot; {formatDuration(m.duration || 30)}</div>
+                          <div className="meeting-block__name">{m.title}</div>
+                          <div className="meeting-block__foot">
+                            {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': 'var(--cyan)', '--pill-bg': 'var(--cyan-dim)' }}>&#128197; Google</span>}
+                            {m.agenda.length > 0 && (
+                              <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.agenda.length} agenda</span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
                     {dayPlaceholders.map(m => (
                       <div key={m.id} className="placeholder-block" title="Needs a confirmed slot — set it up from Meetings To Be Set Up">
                         <div className="placeholder-block__name">{m.title}</div>
@@ -895,41 +992,65 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, weekOffset,
   );
 }
 
-function CalendarPanel({ url, onSave, onHide }){
-  const [open, setOpen] = useState(false);
+function GoogleCalendarSyncPanel({ url, syncStatus, syncError, eventCount, onSave, onUnlink, onSyncNow }){
+  const [open, setOpen] = useState(!url);
   const [draft, setDraft] = useState(url || '');
+
+  function save(){
+    if (!draft.trim()) return;
+    onSave(draft.trim());
+    setOpen(false);
+  }
 
   return (
     <section className="panel">
       <div className="panel__head">
         <div>
-          <p className="panel__eyebrow">External Feed</p>
-          <h2 className="panel__title">Google Calendar</h2>
+          <p className="panel__eyebrow">Google Calendar</p>
+          <h2 className="panel__title">{url ? 'Synced — read-only' : 'Not linked yet'}</h2>
         </div>
         <div className="week-nav">
-          <button className="btn" onClick={() => { setDraft(url || ''); setOpen(o => !o); }}>Connect calendar</button>
-          {url && <button className="btn btn--ghost" onClick={onHide}>Hide embed</button>}
+          {url && (
+            <React.Fragment>
+              <span className="pill" style={{
+                '--pill-color': syncStatus === 'error' ? 'var(--red)' : 'var(--green)',
+                '--pill-bg': syncStatus === 'error' ? 'var(--red-dim)' : 'var(--green-dim)'
+              }}>
+                {syncStatus === 'syncing' ? 'Syncing…' : syncStatus === 'error' ? 'Sync error' : `${eventCount} events`}
+              </span>
+              <button className="btn" onClick={onSyncNow}>Sync now</button>
+              <button className="btn btn--ghost" onClick={onUnlink}>Unlink</button>
+            </React.Fragment>
+          )}
+          {!url && <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>Link Google Calendar</button>}
         </div>
       </div>
+
+      {syncError && <p style={{ color: 'var(--red)', fontFamily: 'var(--font-mono)', fontSize: 11, marginTop: 4 }}>{syncError}</p>}
+
       <div className={`add-form${open ? ' open' : ''}`}>
-        <div className="full" style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', lineHeight: 1.6, marginBottom: 6 }}>
-          In Google Calendar: Settings &rarr; pick your calendar &rarr; "Access permissions" &rarr; enable "Make available to public".
-          Then under "Integrate calendar", copy the <b>Public URL</b> (or the embed <code>src</code>) and paste it below.
-          Note: this makes your calendar's event details visible to anyone with that link.
+        <div className="full" style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', lineHeight: 1.7, marginBottom: 8 }}>
+          <b style={{ color: 'var(--text-hi)' }}>How to find your calendar's secret address:</b><br />
+          1. Open Google Calendar on the web.<br />
+          2. Hover your calendar under "My calendars" &rarr; click the &#8942; menu &rarr; <b>Settings and sharing</b>.<br />
+          3. Scroll to <b>Integrate calendar</b>.<br />
+          4. Copy the <b>Secret address in iCal format</b> (not the public URL).<br />
+          Treat this link like a password — anyone who has it can read your events. It's stored securely and never shown in this app after saving.
         </div>
         <div style={{ gridColumn: '1/-1' }}>
-          <label>Calendar embed / public URL</label>
-          <input type="url" value={draft} onChange={e => setDraft(e.target.value)} placeholder="https://calendar.google.com/calendar/embed?src=..." />
+          <label>Secret iCal address</label>
+          <input type="url" value={draft} onChange={e => setDraft(e.target.value)} placeholder="https://calendar.google.com/calendar/ical/.../private-.../basic.ics" />
         </div>
         <div className="full">
           <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
-          <button className="btn btn--amber" onClick={() => { onSave(draft.trim()); setOpen(false); }}>Save &amp; embed</button>
+          <button className="btn btn--amber" onClick={save}>Save &amp; sync</button>
         </div>
       </div>
+
       {url && (
-        <div style={{ marginTop: 14 }}>
-          <iframe title="Google Calendar" src={url} style={{ width: '100%', height: 420, border: '1px solid var(--line)', borderRadius: 8 }} frameBorder="0" scrolling="no" />
-        </div>
+        <p style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', marginTop: 10 }}>
+          Events sync into your schedule below automatically (checked every minute while this tab is open). Changes you make here to notes, links, or tasks stay local to this app and never write back to Google.
+        </p>
       )}
     </section>
   );
@@ -1223,12 +1344,13 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
   }, [onClose]);
 
   if (!meeting) return null;
+  const isGoogle = meeting.kind === 'google';
 
   const today = todayISO();
   const isReviewType = meeting.type === 'mentor' || meeting.type === 'champion';
 
   let suggestions = [];
-  if (isReviewType){
+  if (isReviewType && !isGoogle){
     const atRisk = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length))));
     const extended = tasks.filter(t => t.status !== 'done' && t.dueRevisions && t.dueRevisions.length > 0);
     const recentlyDone = tasks.filter(t => {
@@ -1255,36 +1377,47 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
       <div className="modal-panel" onClick={e => e.stopPropagation()}>
         <div className="modal-panel__head">
           <div style={{ flex: 1 }}>
-            <p className="panel__eyebrow">{MEETING_TYPES[meeting.type] ? MEETING_TYPES[meeting.type].label : 'Meeting'}</p>
-            <input className="modal-title-input" type="text" value={meeting.title} onChange={e => onUpdate({ title: e.target.value })} />
+            <p className="panel__eyebrow">{isGoogle ? 'Synced from Google Calendar' : (MEETING_TYPES[meeting.type] ? MEETING_TYPES[meeting.type].label : 'Meeting')}</p>
+            {isGoogle ? (
+              <div style={{ fontFamily: 'var(--font-display)', fontSize: 18, fontWeight: 700, marginTop: 2 }}>{meeting.title}</div>
+            ) : (
+              <input className="modal-title-input" type="text" value={meeting.title} onChange={e => onUpdate({ title: e.target.value })} />
+            )}
           </div>
           <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
         </div>
 
-        <div className="modal-grid">
-          <div>
-            <label>Date</label>
-            <input type="date" value={meeting.date || ''} onChange={e => onUpdate({ date: e.target.value })} />
+        {isGoogle ? (
+          <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 10 }}>
+            {meeting.date} &middot; {meeting.time} &middot; {formatDuration(meeting.duration)}
+            {meeting.url && <> &middot; <a href={meeting.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--cyan)' }}>Open in Google Calendar</a></>}
+          </p>
+        ) : (
+          <div className="modal-grid">
+            <div>
+              <label>Date</label>
+              <input type="date" value={meeting.date || ''} onChange={e => onUpdate({ date: e.target.value })} />
+            </div>
+            <div>
+              <label>Start time</label>
+              <TimeSelect value={meeting.time} onChange={time => onUpdate({ time })} />
+            </div>
+            <div>
+              <label>Duration</label>
+              <DurationSelect value={meeting.duration} onChange={duration => onUpdate({ duration })} />
+            </div>
+            <div>
+              <label>Type</label>
+              <select value={meeting.type || 'other'} onChange={e => onUpdate({ type: e.target.value })}>
+                <option value="other">General</option>
+                <option value="pod">POD Connect</option>
+                <option value="mentor">Mentor Sync</option>
+                <option value="champion">Champion Review</option>
+                <option value="sprint">Sprint Call</option>
+              </select>
+            </div>
           </div>
-          <div>
-            <label>Start time</label>
-            <TimeSelect value={meeting.time} onChange={time => onUpdate({ time })} />
-          </div>
-          <div>
-            <label>Duration</label>
-            <DurationSelect value={meeting.duration} onChange={duration => onUpdate({ duration })} />
-          </div>
-          <div>
-            <label>Type</label>
-            <select value={meeting.type || 'other'} onChange={e => onUpdate({ type: e.target.value })}>
-              <option value="other">General</option>
-              <option value="pod">POD Connect</option>
-              <option value="mentor">Mentor Sync</option>
-              <option value="champion">Champion Review</option>
-              <option value="sprint">Sprint Call</option>
-            </select>
-          </div>
-        </div>
+        )}
 
         {suggestions.length > 0 && (
           <div className="modal-field">
@@ -1301,8 +1434,22 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
         )}
 
         <div className="modal-field">
-          <label>Agenda &amp; action items</label>
-          <AgendaList agenda={meeting.agenda} onChange={agenda => onUpdate({ agenda })} />
+          <label>Agenda &amp; action items{isGoogle ? ' (auto-detected from description)' : ''}</label>
+          {isGoogle ? (
+            (meeting.agenda || []).length === 0 ? (
+              <p className="task-empty">No bulleted or numbered lines found in this event's description.</p>
+            ) : (
+              <div className="agenda-list">
+                {meeting.agenda.map(item => (
+                  <div key={item.id} className="agenda-item">
+                    <span className="agenda-item__text">{item.text}</span>
+                  </div>
+                ))}
+              </div>
+            )
+          ) : (
+            <AgendaList agenda={meeting.agenda} onChange={agenda => onUpdate({ agenda })} />
+          )}
         </div>
 
         <div className="modal-field">
@@ -1318,15 +1465,24 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
           />
         </div>
 
-        <div className="modal-field">
-          <label>Notes</label>
-          <textarea className="modal-notes" rows={6} placeholder="Discussion notes, decisions, follow-ups…"
-            value={meeting.notes || ''} onChange={e => onUpdate({ notes: e.target.value })} />
-        </div>
+        {isGoogle ? (
+          meeting.description && (
+            <div className="modal-field">
+              <label>Description (from Google)</label>
+              <p style={{ fontFamily: 'var(--font-body)', fontSize: 12, color: 'var(--text-lo)', whiteSpace: 'pre-wrap' }}>{meeting.description}</p>
+            </div>
+          )
+        ) : (
+          <div className="modal-field">
+            <label>Notes</label>
+            <textarea className="modal-notes" rows={6} placeholder="Discussion notes, decisions, follow-ups…"
+              value={meeting.notes || ''} onChange={e => onUpdate({ notes: e.target.value })} />
+          </div>
+        )}
 
         <div className="modal-footer">
-          <button className="btn btn--danger" onClick={() => { onDelete(); onClose(); }}>Delete meeting</button>
-          <button className="btn btn--amber" onClick={onClose}>Done</button>
+          {!isGoogle && <button className="btn btn--danger" onClick={() => { onDelete(); onClose(); }}>Delete meeting</button>}
+          <button className="btn btn--amber" onClick={onClose} style={isGoogle ? { marginLeft: 'auto' } : undefined}>Done</button>
         </div>
       </div>
     </div>
@@ -2252,7 +2408,7 @@ function App(){
   const [linkTags, setLinkTags] = useState(DEFAULT_LINK_TAGS);
   const [pendingMeetings, setPendingMeetings] = useState([]);
   const [plannedMeetings, setPlannedMeetings] = useState([]);
-  const [settings, setSettings] = useState({ calendarEmbedUrl: '' });
+  const [settings, setSettings] = useState({ calendarEmbedUrl: '', notificationsEnabled: false });
   const [weekOffset, setWeekOffset] = useState(0);
   const [addMeetingOpen, setAddMeetingOpen] = useState(false);
   const [now, setNow] = useState(new Date());
@@ -2272,7 +2428,13 @@ function App(){
   const [lastEodPromptDate, setLastEodPromptDate] = useState('');
   const [eodModalOpen, setEodModalOpen] = useState(false);
   const [legacyImport, setLegacyImport] = useState(null);
+  const [googleEvents, setGoogleEvents] = useState([]);
+  const [googleSyncStatus, setGoogleSyncStatus] = useState('idle'); // idle | syncing | error
+  const [googleSyncError, setGoogleSyncError] = useState('');
+  const [googleLinkOpen, setGoogleLinkOpen] = useState(false);
   const saveTimer = useRef(null);
+  const notificationsEnabledRef = useRef(false);
+  useEffect(() => { notificationsEnabledRef.current = settings.notificationsEnabled; }, [settings.notificationsEnabled]);
 
   // Check for an existing session on load, and keep listening for sign-in/out.
   useEffect(() => {
@@ -2294,7 +2456,7 @@ function App(){
     setLinkTags((parsed.linkTags && parsed.linkTags.length) ? parsed.linkTags : DEFAULT_LINK_TAGS);
     setPendingMeetings(parsed.pendingMeetings || []);
     setPlannedMeetings(parsed.plannedMeetings || []);
-    setSettings(Object.assign({ calendarEmbedUrl: '' }, parsed.settings || {}));
+    setSettings(Object.assign({ calendarEmbedUrl: '', notificationsEnabled: false }, parsed.settings || {}));
     setWorkingHours(parsed.workingHours || {});
     setDefaultWorkingHours(parsed.defaultWorkingHours || { start: '09:00', end: '18:00' });
     setOooRanges(parsed.oooRanges || {});
@@ -2305,8 +2467,21 @@ function App(){
 
   // Once signed in, load this user's data from Supabase (each user's row is
   // walled off from everyone else's by the database's row-level security).
+  //
+  // IMPORTANT: this depends on the user's *id* (a stable string), not the whole
+  // `session` object. Supabase silently refreshes the auth token roughly every
+  // hour and on tab focus, firing onAuthStateChange with a brand-new session
+  // object each time — if this effect depended on `session` directly, every one
+  // of those routine refreshes would re-run the full load logic, and any
+  // transient hiccup in that refetch (network blip, a race during token
+  // rotation) could fall through to "no data found" and overwrite real data
+  // with empty defaults via the save effect. Keying on the id avoids re-running
+  // this at all for same-user token refreshes.
+  const userId = session && session.user ? session.user.id : null;
+  const hasLoadedOnceRef = useRef(false);
+
   useEffect(() => {
-    if (!session) { setLoaded(false); return; }
+    if (!userId) { setLoaded(false); hasLoadedOnceRef.current = false; return; }
     let cancelled = false;
 
     (async () => {
@@ -2316,7 +2491,7 @@ function App(){
         const { data, error } = await supabaseClient
           .from('app_state')
           .select('data')
-          .eq('user_id', session.user.id)
+          .eq('user_id', userId)
           .maybeSingle();
         if (error) throw error;
         if (cancelled) return;
@@ -2327,7 +2502,11 @@ function App(){
           resumedDigestWeek = resumed.lastDigestWeek;
           setLastVisitDate(resumedLastVisit);
           setLastDigestWeek(resumedDigestWeek);
-        } else {
+          hasLoadedOnceRef.current = true;
+        } else if (!hasLoadedOnceRef.current) {
+          // Only seed defaults on a genuine first load for this account. If we'd
+          // already loaded real data once before, an empty result here is
+          // suspicious rather than a real "you're new" signal — see note above.
           const seed = getSeedData();
           setCategories(seed.categories);
           setCategoryCounter(seed.categoryCounter);
@@ -2337,6 +2516,9 @@ function App(){
           setLinkTags(seed.linkTags);
           setPendingMeetings(seed.pendingMeetings);
           setPlannedMeetings(seed.plannedMeetings);
+          hasLoadedOnceRef.current = true;
+        } else {
+          console.warn('Cloud fetch returned no data after an earlier successful load — keeping existing in-memory data rather than overwriting it.');
         }
 
         // Check for data left over in this browser from before sign-in existed,
@@ -2364,16 +2546,22 @@ function App(){
       if (cancelled) return;
 
       const today = todayISO();
-      if (resumedLastVisit !== today) setDailyPlannerOpen(true);
+      if (resumedLastVisit !== today) {
+        setDailyPlannerOpen(true);
+        if (notificationsEnabledRef.current) notify('Good morning', 'Set up your working hours and today\'s plan in Control Centre.');
+      }
       const isFriday = new Date().getDay() === 5;
       const mondayIso = isoOf(getMonday(new Date()));
-      if (isFriday && resumedDigestWeek !== mondayIso) setDigestOpen(true);
+      if (isFriday && resumedDigestWeek !== mondayIso) {
+        setDigestOpen(true);
+        if (notificationsEnabledRef.current) notify('Weekly digest ready', 'Your Friday progress digest is ready to review.');
+      }
 
       setLoaded(true);
     })();
 
     return () => { cancelled = true; };
-  }, [session]);
+  }, [userId]);
 
   // Save whenever data changes, debounced so we're not hitting the database on
   // every keystroke — skipped until the initial load for this user completes.
@@ -2402,6 +2590,19 @@ function App(){
     supabaseClient.auth.signOut();
   }
 
+  async function toggleNotifications(){
+    if (settings.notificationsEnabled) {
+      setSettings(s => ({ ...s, notificationsEnabled: false }));
+      return;
+    }
+    if (typeof Notification === 'undefined') return;
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      setSettings(s => ({ ...s, notificationsEnabled: true }));
+      notify('Notifications on', 'Control Centre will now alert you for meeting prep, wrap-ups, and daily reminders.');
+    }
+  }
+
   // Clock
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
@@ -2419,8 +2620,69 @@ function App(){
     const nowMin = now.getHours() * 60 + now.getMinutes();
     if (nowMin >= minutesSinceMidnight(hours.end)) {
       setEodModalOpen(true);
+      if (settings.notificationsEnabled) notify('End of day', `You've got ${stickyNotes.length} unfiled quick note${stickyNotes.length === 1 ? '' : 's'} — file them or they'll resurface tomorrow.`);
     }
-  }, [now, loaded, stickyNotes, workingHours, defaultWorkingHours, lastEodPromptDate]);
+  }, [now, loaded, stickyNotes, workingHours, defaultWorkingHours, lastEodPromptDate, settings.notificationsEnabled]);
+
+  // Google Calendar sync: fetch on link, then poll every 60s while the tab is
+  // open and a calendar is linked. This is polling, not true push — Google's
+  // real push notifications need a public webhook server, which a static
+  // site doesn't have. A minute's staleness is the honest trade-off here.
+  async function syncGoogleCalendar(){
+    if (!settings.googleCalendarUrl || !session) return;
+    setGoogleSyncStatus('syncing');
+    setGoogleSyncError('');
+    try {
+      const result = await fetchGoogleCalendarEvents(session.access_token);
+      setGoogleEvents(result.events || []);
+      setGoogleSyncStatus('idle');
+      if (result.error) setGoogleSyncError(result.error);
+    } catch (e) {
+      console.error('Google Calendar sync failed', e);
+      setGoogleSyncStatus('error');
+      setGoogleSyncError(e.message || 'Sync failed');
+    }
+  }
+
+  useEffect(() => {
+    if (!loaded || !settings.googleCalendarUrl) { setGoogleEvents([]); return; }
+    syncGoogleCalendar();
+    const id = setInterval(syncGoogleCalendar, 60000);
+    return () => clearInterval(id);
+  }, [loaded, settings.googleCalendarUrl, session]);
+
+  // Meeting-prep tasks: notify once, the moment each one's reminder window opens.
+  const notifiedPrepRef = useRef(new Set());
+  useEffect(() => {
+    if (!loaded || !notificationsEnabledRef.current) return;
+    const combined = [...plannedMeetings, ...googleEvents.map(normalizeGoogleEvent)];
+    tasks.forEach(t => {
+      if (!t.meetingId || t.status === 'done') return;
+      const meeting = combined.find(m => m.id === t.meetingId);
+      if (!meeting) return;
+      const hours = getWorkingHours(workingHours, defaultWorkingHours, meeting.date);
+      const info = getPrepReminderStatus(meeting, hours);
+      if (info && info.active && !notifiedPrepRef.current.has(t.id)) {
+        notifiedPrepRef.current.add(t.id);
+        notify('Meeting prep needed', `"${t.title}" — before "${meeting.title}" at ${meeting.time}`);
+      }
+    });
+  }, [now, loaded, tasks, plannedMeetings, googleEvents, workingHours, defaultWorkingHours]);
+
+  // Scheduled meetings: notify once when a meeting crosses 75% of its duration.
+  const notifiedWrapRef = useRef(new Set());
+  useEffect(() => {
+    if (!loaded || !notificationsEnabledRef.current) return;
+    const today_ = todayISO();
+    plannedMeetings.filter(m => m.date === today_ && m.kind !== 'focus').forEach(m => {
+      const status = getMeetingStatus(m.date, m.time || '00:00', m.duration);
+      const key = `${m.id}-${today_}`;
+      if (status.status === 'wrapping' && !notifiedWrapRef.current.has(key)) {
+        notifiedWrapRef.current.add(key);
+        notify('Wrapping up?', `"${m.title}" is at ~75% — worth checking the agenda.`);
+      }
+    });
+  }, [now, loaded, plannedMeetings]);
 
   /* ---------- Category actions ---------- */
   function addCategory(title){
@@ -2646,7 +2908,8 @@ function App(){
   const realParity = getParity(realMonday);
   const todayIdx = (new Date().getDay() + 6) % 7;
   const meetingsToday = meetings.filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity)).length
-    + plannedMeetings.filter(m => m.date === today).length;
+    + plannedMeetings.filter(m => m.date === today).length
+    + googleEvents.map(normalizeGoogleEvent).filter(m => m.date === today).length;
   const tasksDueToday = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today)).length;
   const atRiskCount = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length)))).length;
   const doneCount = tasks.filter(t => t.status === 'done').length;
@@ -2671,10 +2934,13 @@ function App(){
   const weekLapsed = computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, realMonday, today);
   const weekElapsedPercent = weekLapsed.percent;
 
+  const normalizedGoogleEvents = googleEvents.map(normalizeGoogleEvent);
+  const allMeetingsForLookup = [...plannedMeetings, ...normalizedGoogleEvents];
+
   const prepReminders = tasks
     .filter(t => t.meetingId && t.status !== 'done')
     .map(t => {
-      const meeting = plannedMeetings.find(m => m.id === t.meetingId);
+      const meeting = allMeetingsForLookup.find(m => m.id === t.meetingId);
       if (!meeting) return null;
       const hours = getWorkingHours(workingHours, defaultWorkingHours, meeting.date);
       const info = getPrepReminderStatus(meeting, hours);
@@ -2706,6 +2972,9 @@ function App(){
             <div className="clock">{now.toLocaleTimeString('en-GB')}</div>
             <div className="clock-date">{WEEKDAY_LABELS[(now.getDay() + 6) % 7]}, {now.getDate()} {MONTHS[now.getMonth()]} {now.getFullYear()}</div>
           </div>
+          <button className={`btn${settings.notificationsEnabled ? ' btn--amber' : ' btn--ghost'}`} onClick={toggleNotifications} title="Toggle browser notifications">
+            {settings.notificationsEnabled ? '🔔 On' : '🔕 Off'}
+          </button>
           <button className="btn btn--ghost" onClick={signOut}>Sign out</button>
         </div>
       </header>
@@ -2769,6 +3038,7 @@ function App(){
             <TodayMeetingsCard
               meetings={meetings}
               plannedMeetings={plannedMeetings}
+              googleEvents={normalizedGoogleEvents}
               pendingMeetings={pendingMeetings}
               todayIdx={todayIdx}
               realParity={realParity}
@@ -2812,6 +3082,7 @@ function App(){
             meetings={meetings}
             pendingMeetings={pendingMeetings}
             plannedMeetings={plannedMeetings}
+            googleEvents={normalizedGoogleEvents}
             weekOffset={weekOffset}
             setWeekOffset={setWeekOffset}
             onDeleteMeeting={deleteMeeting}
@@ -2828,10 +3099,14 @@ function App(){
             onAddOOOBlock={addOOOBlock}
             onDeleteOOOBlock={deleteOOOBlock}
           />
-          <CalendarPanel
-            url={settings.calendarEmbedUrl}
-            onSave={url => setSettings(s => ({ ...s, calendarEmbedUrl: url }))}
-            onHide={() => setSettings(s => ({ ...s, calendarEmbedUrl: '' }))}
+          <GoogleCalendarSyncPanel
+            url={settings.googleCalendarUrl}
+            syncStatus={googleSyncStatus}
+            syncError={googleSyncError}
+            eventCount={googleEvents.length}
+            onSave={url => setSettings(s => ({ ...s, googleCalendarUrl: url }))}
+            onUnlink={() => { setSettings(s => ({ ...s, googleCalendarUrl: '' })); setGoogleEvents([]); }}
+            onSyncNow={syncGoogleCalendar}
           />
         </React.Fragment>
       )}
@@ -2899,12 +3174,12 @@ function App(){
 
       {meetingDetailId && (
         <MeetingDetailModal
-          meeting={plannedMeetings.find(m => m.id === meetingDetailId)}
+          meeting={allMeetingsForLookup.find(m => m.id === meetingDetailId)}
           tasks={tasks}
           categories={categories}
           onClose={() => setMeetingDetailId(null)}
-          onUpdate={patch => updatePlannedMeeting(meetingDetailId, patch)}
-          onDelete={() => deletePlannedMeeting(meetingDetailId)}
+          onUpdate={patch => { if (!meetingDetailId.startsWith('google-')) updatePlannedMeeting(meetingDetailId, patch); }}
+          onDelete={() => { if (!meetingDetailId.startsWith('google-')) deletePlannedMeeting(meetingDetailId); }}
           onAddPrepTask={addPrepTask}
           onTogglePrepTask={togglePrepTask}
           onDeletePrepTask={deleteTask}
