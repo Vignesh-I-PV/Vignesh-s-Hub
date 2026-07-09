@@ -56,6 +56,87 @@ const TASK_FILTERS = [
   { id: 'all',   label: 'All' }
 ];
 
+/* ---------- Claude Assistant: tool schema ---------- */
+// Scope, deliberately: task management + the day planner. No meetings/doc-library
+// mutations from here. Reads execute immediately; writes always pause for a confirm
+// card in the chat panel before anything touches real data.
+const READ_ONLY_TOOLS = new Set(['get_app_context', 'preview_day_plan']);
+
+const ASSISTANT_TOOLS = [
+  {
+    name: 'get_app_context',
+    description: "Read the user's open (not-done) tasks, categories, and today's (or another date's) meetings/working hours/out-of-office. Call this first whenever you need real task IDs or category IDs to act on, or need to reason about someone's day.",
+    input_schema: {
+      type: 'object',
+      properties: { dateISO: { type: 'string', description: "Date to pull calendar context for, YYYY-MM-DD. Defaults to today if omitted." } }
+    }
+  },
+  {
+    name: 'create_task',
+    description: 'Create a new task.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        categoryId: { type: 'string', description: 'A category id from get_app_context.' },
+        startDate: { type: 'string', description: 'YYYY-MM-DD, optional' },
+        endDate: { type: 'string', description: 'YYYY-MM-DD, optional' },
+        weight: { type: 'number', description: '1-10, optional, defaults to 1' },
+        estimatedDuration: { type: 'number', description: 'Minutes, optional — needed for this task to be included in day planning.' }
+      },
+      required: ['title', 'categoryId']
+    }
+  },
+  {
+    name: 'update_task',
+    description: 'Update fields on an existing task (title, status, dates, weight, estimated duration, notes, risk flag). Only pass fields you want changed.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string' },
+        title: { type: 'string' },
+        status: { type: 'string', enum: ['todo', 'progress', 'done'] },
+        startDate: { type: 'string' },
+        endDate: { type: 'string' },
+        weight: { type: 'number' },
+        estimatedDuration: { type: 'number' },
+        notes: { type: 'string' },
+        atRisk: { type: 'boolean' }
+      },
+      required: ['taskId']
+    }
+  },
+  {
+    name: 'delete_task',
+    description: 'Permanently delete a task. Use sparingly and only when the user clearly wants it gone, not just marked done.',
+    input_schema: { type: 'object', properties: { taskId: { type: 'string' } }, required: ['taskId'] }
+  },
+  {
+    name: 'add_subtask',
+    description: 'Add a sub-task to an existing task.',
+    input_schema: {
+      type: 'object',
+      properties: { taskId: { type: 'string' }, title: { type: 'string' }, startDate: { type: 'string' }, endDate: { type: 'string' } },
+      required: ['taskId', 'title']
+    }
+  },
+  {
+    name: 'toggle_subtask',
+    description: "Flip a sub-task's done/not-done state.",
+    input_schema: { type: 'object', properties: { taskId: { type: 'string' }, subtaskId: { type: 'string' } }, required: ['taskId', 'subtaskId'] }
+  },
+  {
+    name: 'preview_day_plan',
+    description: "Run the rule-based day-planner for a date (defaults to today) and return the proposed focus-time placements, anything that couldn't fit, and any tasks missing a time estimate. This is read-only — it also opens the same preview the user sees from the 'Plan my day' button, but changes nothing until apply_day_plan is called.",
+    input_schema: { type: 'object', properties: { dateISO: { type: 'string' } } }
+  },
+  {
+    name: 'apply_day_plan',
+    description: "Write the most recently previewed day-plan's focus blocks onto the calendar for that date. Always call preview_day_plan first in the same conversation so there's something current to apply.",
+    input_schema: { type: 'object', properties: { dateISO: { type: 'string' } } }
+  }
+];
+
 const STATUS_ORDER = ['todo', 'progress', 'done'];
 const STATUS_META = {
   todo:     { label: 'To Do',       color: 'var(--text-lo)' },
@@ -229,6 +310,11 @@ const TIME_OPTIONS = (() => {
 
 const DURATION_OPTIONS = [15, 30, 45, 60, 90, 120, 180];
 
+// Day-planner tuning: how much buffer to leave before a meeting a prep task is tied
+// to, and the smallest sliver of free time worth carving out of a gap.
+const PREP_BUFFER_MINUTES = 15;
+const MIN_CHUNK_MINUTES = 15;
+
 function formatDuration(mins){
   if (mins < 60) return `${mins} min`;
   const h = mins / 60;
@@ -380,6 +466,185 @@ function computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, monday,
   const percent = totalMin > 0 ? Math.round((elapsedMin / totalMin) * 100) : 0;
   return { percent, totalMin, elapsedMin };
 }
+
+/* ---------- Day Planner engine ---------- */
+// Deterministic, rule-based — no AI in this loop. Given a date and the app's state,
+// works out where today's not-yet-done tasks should go, respecting meetings as fixed
+// and giving meeting-prep tasks a hard "finish before the meeting" constraint instead
+// of just sorting everything by due date.
+
+function minutesToTime(mins){
+  const m = Math.max(0, Math.round(mins));
+  const h = Math.floor(m / 60) % 24;
+  const mm = m % 60;
+  return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+// Every calendar block already occupying time on a given day — recurring meetings,
+// one-off planned meetings (incl. previously-placed Focus Time), and synced Google
+// events — normalized to {id, title, date, time, duration}. Recurring meetings can't
+// currently have prep tasks linked to them (same as the existing prep-reminder logic),
+// so they're busy blocks but not lookup targets for a task's meetingId.
+function getMeetingsOnDate(dateISO, { meetings, plannedMeetings, googleEvents }){
+  const d = new Date(dateISO);
+  const weekdayIdx = (d.getDay() + 6) % 7;
+  const monday = getMonday(d);
+  const parity = getParity(monday);
+  const recurring = meetings
+    .filter(m => m.weekday === weekdayIdx && (m.cadence === 'weekly' || m.parity === parity))
+    .map(m => ({ id: m.id, title: m.name, date: dateISO, time: m.time, duration: m.duration || 30, kind: 'recurring' }));
+  const planned = plannedMeetings.filter(m => m.date === dateISO);
+  const google = googleEvents.map(normalizeGoogleEvent).filter(m => m.date === dateISO);
+  return [...recurring, ...planned, ...google];
+}
+
+// Free minutes-since-midnight intervals left in the working day after subtracting
+// OOO and everything already on the calendar. Sorted, merged, no overlaps.
+function getFreeIntervals(dateISO, ctx){
+  const hours = getWorkingHours(ctx.workingHours, ctx.defaultWorkingHours, dateISO);
+  const dayOoo = ctx.oooRanges[dateISO];
+  if (dayOoo && dayOoo.fullDay) return [];
+
+  const windowStart = minutesSinceMidnight(hours.start);
+  const windowEnd = minutesSinceMidnight(hours.end);
+  if (windowEnd <= windowStart) return [];
+
+  const busy = [];
+  ((dayOoo && dayOoo.blocks) || []).forEach(b => busy.push([minutesSinceMidnight(b.start), minutesSinceMidnight(b.end)]));
+  getMeetingsOnDate(dateISO, ctx).forEach(m => {
+    const s = minutesSinceMidnight(m.time || '00:00');
+    busy.push([s, s + (m.duration || 30)]);
+  });
+
+  busy.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  busy.forEach(([bs, be]) => {
+    const s = Math.max(bs, windowStart), e = Math.min(be, windowEnd);
+    if (e <= s) return;
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  });
+
+  const free = [];
+  let cursor = windowStart;
+  merged.forEach(([s, e]) => {
+    if (s > cursor) free.push([cursor, s]);
+    cursor = Math.max(cursor, e);
+  });
+  if (cursor < windowEnd) free.push([cursor, windowEnd]);
+  return free;
+}
+
+// The plan itself: which not-done, appears-today tasks get which slot. Meeting-prep
+// tasks (tied to a meeting happening today) are placed first, ordered by how soon
+// their meeting starts; everything else follows, ordered overdue-first then by
+// nearest end date then by weight. Tasks can split across multiple free gaps.
+// The plan itself: which not-done, appears-today tasks get which slot, in three
+// priority tiers — (1) meeting-prep tasks, hard-constrained to finish before their
+// meeting; (2) today's regular tasks, not yet past their deadline; (3) backlog —
+// tasks whose deadline has already been breached, simple oldest-first, only using
+// whatever capacity is left over once the first two tiers are placed.
+function computeDayPlan(dateISO, ctx){
+  const { tasks } = ctx;
+  const dayOoo = ctx.oooRanges[dateISO];
+  if (dayOoo && dayOoo.fullDay) {
+    return { placements: [], unfit: [], missingDuration: [], fullDayOff: true };
+  }
+
+  const meetingsOnDate = getMeetingsOnDate(dateISO, ctx);
+  const meetingById = new Map(meetingsOnDate.filter(m => m.kind !== 'recurring').map(m => [m.id, m]));
+
+  const candidates = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, dateISO));
+  const missingDuration = candidates.filter(t => !t.estimatedDuration);
+  const schedulable = candidates.filter(t => t.estimatedDuration);
+
+  const prepTier = [];
+  const todayTier = [];
+  const backlogTier = [];
+  schedulable.forEach(t => {
+    const meeting = t.meetingId ? meetingById.get(t.meetingId) : null;
+    if (meeting) {
+      prepTier.push({ task: t, tier: 'prep', deadline: minutesSinceMidnight(meeting.time || '00:00') - PREP_BUFFER_MINUTES, meetingTitle: meeting.title });
+    } else if (t.endDate && t.endDate < dateISO) {
+      backlogTier.push({ task: t, tier: 'backlog' });
+    } else {
+      todayTier.push({ task: t, tier: 'today' });
+    }
+  });
+  prepTier.sort((a, b) => a.deadline - b.deadline);
+  todayTier.sort((a, b) => {
+    const aEnd = a.task.endDate || '9999-99-99';
+    const bEnd = b.task.endDate || '9999-99-99';
+    if (aEnd !== bEnd) return aEnd < bEnd ? -1 : 1;
+    return (b.task.weight || 1) - (a.task.weight || 1);
+  });
+  // Backlog: simple oldest-first by how long-breached the deadline is — no weight
+  // tie-break, on purpose, per the "keep it simple" call.
+  backlogTier.sort((a, b) => (a.task.endDate < b.task.endDate ? -1 : a.task.endDate > b.task.endDate ? 1 : 0));
+
+  const ordered = [...prepTier, ...todayTier, ...backlogTier];
+
+  const free = getFreeIntervals(dateISO, ctx);
+  const placements = [];
+  const unfit = [];
+
+  ordered.forEach(entry => {
+    const { task, deadline, meetingTitle, tier } = entry;
+    let remaining = task.estimatedDuration;
+
+    for (let i = 0; i < free.length && remaining > 0; i++){
+      const original = free[i];
+      const s = original[0];
+      const e = deadline !== undefined ? Math.min(original[1], deadline) : original[1];
+      const available = e - s;
+      if (available < MIN_CHUNK_MINUTES) continue;
+      const take = Math.min(available, remaining);
+      if (take < MIN_CHUNK_MINUTES && remaining > MIN_CHUNK_MINUTES) continue;
+
+      placements.push({
+        taskId: task.id, taskTitle: task.title, theme: task.theme,
+        date: dateISO, time: minutesToTime(s), duration: take,
+        meetingId: task.meetingId || null, meetingTitle: meetingTitle || null,
+        tier
+      });
+      remaining -= take;
+
+      const newStart = s + take;
+      if (newStart >= original[1]) { free.splice(i, 1); i--; }
+      else free[i] = [newStart, original[1]];
+    }
+
+    if (remaining > 0) {
+      unfit.push({
+        taskId: task.id, taskTitle: task.title, remaining, tier,
+        reason: deadline !== undefined ? `Not enough free time before "${meetingTitle}"` : (tier === 'backlog' ? 'No leftover time today' : 'Not enough free time today')
+      });
+    }
+  });
+
+  const backlogCount = backlogTier.length;
+  return { placements, unfit, missingDuration, fullDayOff: false, backlogCount };
+}
+
+// A lightweight fingerprint of everything computeDayPlan's output actually depends
+// on for a given date. Used to detect when something the user did — added/edited/
+// deleted a task, added or moved a meeting — would change today's plan, so we know
+// when to offer an updated one. Deliberately excludes this planner's own past output
+// (auto-plan focus blocks) so applying a plan never immediately looks like "a change".
+function getDayPlanSignatureInputs(dateISO, ctx){
+  const relevantTasks = ctx.tasks
+    .filter(t => t.status !== 'done' && taskAppearsOn(t, dateISO))
+    .map(t => `${t.id}:${t.estimatedDuration || 0}:${t.startDate || ''}:${t.endDate || ''}:${t.meetingId || ''}:${t.weight || 1}`)
+    .sort();
+  const meetingsToday = getMeetingsOnDate(dateISO, ctx)
+    .filter(m => !(m.kind === 'focus' && m.source === 'auto-plan'))
+    .map(m => `${m.id}:${m.time}:${m.duration}`)
+    .sort();
+  const hours = getWorkingHours(ctx.workingHours, ctx.defaultWorkingHours, dateISO);
+  return JSON.stringify({ relevantTasks, meetingsToday, hours, ooo: ctx.oooRanges[dateISO] || null });
+}
+
 
 /* ---------- A little personality ---------- */
 /* ---------- Browser notifications ---------- */
@@ -1879,6 +2144,13 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
             <input type="number" min="1" max="10" step="1" value={task.weight || 1}
               onChange={e => onUpdate({ weight: Math.max(1, Number(e.target.value) || 1) })} />
           </div>
+          <div>
+            <label>Estimated time <span style={{ color: 'var(--text-faint)', fontWeight: 400 }}>(for day planning)</span></label>
+            <select value={task.estimatedDuration || ''} onChange={e => onUpdate({ estimatedDuration: e.target.value ? Number(e.target.value) : null })}>
+              <option value="">No estimate</option>
+              {DURATION_OPTIONS.map(d => <option key={d} value={d}>{formatDuration(d)}</option>)}
+            </select>
+          </div>
         </div>
 
         {revisions.length > 0 && (
@@ -2130,6 +2402,126 @@ function TimeLapsedPanel({ workingHours, defaultWorkingHours, oooRanges, now }){
         </React.Fragment>
       )}
     </section>
+  );
+}
+
+const TIER_LABELS = { prep: 'Meeting prep', today: 'Today', backlog: 'Backlog' };
+
+function DayPlanModal({ preview, categories, variant, onApply, onClose, onGoToTask, onDelay }){
+  const [items, setItems] = useState(preview ? preview.placements : []);
+  useEffect(() => { setItems(preview ? preview.placements : []); }, [preview]);
+
+  useEffect(() => {
+    function onKey(e){ if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  if (!preview) return null;
+  const { unfit, missingDuration, fullDayOff, backlogCount } = preview;
+
+  function updateItem(i, patch){
+    setItems(its => its.map((it, idx) => (idx === i ? { ...it, ...patch } : it)));
+  }
+  function removeItem(i){
+    setItems(its => its.filter((_, idx) => idx !== i));
+  }
+  function delayItem(i){
+    const item = items[i];
+    setItems(its => its.filter((_, idx) => idx !== i));
+    if (item) onDelay(item.taskId);
+  }
+
+  const headings = {
+    morning: ['Good morning', "Here's today's plan"],
+    update: ['Your day changed', 'Updated plan available'],
+    manual: ['Rule-based, not AI — reruns any time', "Today's proposed focus blocks"]
+  };
+  const [eyebrow, title] = headings[variant] || headings.manual;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">{eyebrow}</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700 }}>{title}</div>
+          </div>
+          <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
+        </div>
+
+        {fullDayOff ? (
+          <p style={{ color: 'var(--text-lo)' }}>Today's marked Out of Office — nothing to plan.</p>
+        ) : (
+          <React.Fragment>
+            <div className="modal-field">
+              <label>Suggested blocks {items.length > 0 ? `(${items.length})` : ''}{backlogCount > 0 ? ` · ${backlogCount} in backlog` : ''}</label>
+              {items.length === 0 ? (
+                <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>Nothing left in the plan — add tasks or re-run planning.</p>
+              ) : (
+                <div className="today-list">
+                  {items.map((p, i) => {
+                    const cat = categoryById(categories, p.theme);
+                    return (
+                      <div key={`${p.taskId}-${i}`} className="today-item today-item--editable">
+                        <TimeSelect value={p.time} onChange={v => updateItem(i, { time: v })} />
+                        <DurationSelect value={p.duration} onChange={v => updateItem(i, { duration: v })} />
+                        <span className="today-item__title" style={{ cursor: 'pointer' }} onClick={() => onGoToTask(p.taskId)}>
+                          {cat && <span className="category-subgroup__dot" style={{ background: cat.chip, marginRight: 6 }} />}
+                          {p.taskTitle}
+                        </span>
+                        {p.tier && <span className="chat-bubble__tool-chip">{TIER_LABELS[p.tier] || p.tier}</span>}
+                        {p.meetingTitle && <span style={{ color: 'var(--amber)', fontSize: 11 }}>before "{p.meetingTitle}"</span>}
+                        <button className="icon-btn" title="Delay to tomorrow" onClick={() => delayItem(i)}>&raquo;</button>
+                        <button className="icon-btn" title="Remove from today's plan" onClick={() => removeItem(i)}>&times;</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {unfit.length > 0 && (
+              <div className="modal-field">
+                <label style={{ color: 'var(--red)' }}>Couldn't fully fit ({unfit.length})</label>
+                <div className="today-list">
+                  {unfit.map(u => (
+                    <div key={u.taskId} className="today-item" style={{ cursor: 'pointer' }} onClick={() => onGoToTask(u.taskId)}>
+                      <span className="today-item__title">
+                        {u.taskTitle}
+                        {u.tier && <span className="chat-bubble__tool-chip" style={{ marginLeft: 6 }}>{TIER_LABELS[u.tier] || u.tier}</span>}
+                      </span>
+                      <span style={{ color: 'var(--red)', fontSize: 11 }}>{u.reason} &middot; {formatDuration(u.remaining)} short</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {missingDuration.length > 0 && (
+              <div className="modal-field">
+                <label style={{ color: 'var(--amber)' }}>Skipped — no time estimate ({missingDuration.length})</label>
+                <div className="today-list">
+                  {missingDuration.map(t => (
+                    <div key={t.id} className="today-item" style={{ cursor: 'pointer' }} onClick={() => onGoToTask(t.id)}>
+                      <span className="today-item__title">{t.title}</span>
+                      <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>Open it and add an estimate to include it next time</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </React.Fragment>
+        )}
+
+        <div className="modal-footer">
+          <button className="btn btn--ghost" onClick={onClose}>{variant === 'update' ? 'Keep current plan' : 'Cancel'}</button>
+          {items.length > 0 && (
+            <button className="btn btn--amber" onClick={() => onApply(items)}>{variant === 'update' ? 'Update plan' : 'Apply to calendar'}</button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2395,6 +2787,153 @@ function AuthGate(){
   );
 }
 
+/* ============================== Claude Assistant chat panel ============================== */
+
+// Renders a single chat bubble from an Anthropic-format message. Assistant messages
+// can mix text blocks with tool_use blocks (shown as small inline chips, not the raw
+// JSON) — tool_result / user turns built from tool results are never shown as bubbles.
+function ChatMessageBubble({ message }){
+  if (message.role === 'user' && typeof message.content !== 'string') return null; // tool-result turn, not user-typed
+  const blocks = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content;
+  const textBlocks = blocks.filter(b => b.type === 'text' && b.text && b.text.trim());
+  const toolBlocks = blocks.filter(b => b.type === 'tool_use');
+  if (textBlocks.length === 0 && toolBlocks.length === 0) return null;
+
+  return (
+    <div className={`chat-bubble chat-bubble--${message.role}`}>
+      {textBlocks.map((b, i) => <p key={i}>{b.text}</p>)}
+      {toolBlocks.map(b => (
+        <div key={b.id} className="chat-bubble__tool-chip">&#9881; {b.name.replace(/_/g, ' ')}</div>
+      ))}
+    </div>
+  );
+}
+
+function ChatConfirmCard({ confirmation, onAccept, onReject }){
+  const destructive = confirmation.name === 'delete_task';
+  return (
+    <div className={`chat-confirm-card${destructive ? ' chat-confirm-card--danger' : ''}`}>
+      <p className="chat-confirm-card__desc">{confirmation.description}</p>
+      <div className="chat-confirm-card__actions">
+        <button className="btn btn--ghost" onClick={() => onReject(confirmation.id)}>Decline</button>
+        <button className={`btn${destructive ? ' btn--danger' : ' btn--amber'}`} onClick={() => onAccept(confirmation.id)}>
+          {destructive ? 'Confirm delete' : 'Apply'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ApiKeyModal({ open, onClose, onSave, onRemove, hasKey, busy, error }){
+  const [key, setKey] = useState('');
+  useEffect(() => { if (open) setKey(''); }, [open]);
+  if (!open) return null;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">Bring your own key</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 18, fontWeight: 700 }}>
+              {hasKey ? 'Manage your Anthropic API key' : 'Connect your Anthropic API key'}
+            </div>
+          </div>
+          <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
+        </div>
+
+        <p style={{ fontSize: 12, color: 'var(--text-lo)', lineHeight: 1.6 }}>
+          The assistant runs on your own Anthropic API key, billed to your own account — not the app owner's.
+          Grab one from <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com/settings/keys</a> and paste it below.
+          {hasKey && ' A key is already connected — paste a new one to replace it.'}
+        </p>
+
+        <div className="modal-field">
+          <label>API key</label>
+          <input type="password" placeholder="sk-ant-..." value={key} onChange={e => setKey(e.target.value)} autoFocus />
+        </div>
+
+        {error && <p style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--font-mono)' }}>{error}</p>}
+
+        <div className="modal-footer">
+          {hasKey && <button className="btn btn--danger" disabled={busy} onClick={onRemove}>Disconnect</button>}
+          <button className="btn btn--amber" disabled={busy || !key.trim()} style={{ marginLeft: 'auto' }} onClick={() => onSave(key.trim())}>
+            {busy ? 'Saving…' : 'Save key'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChatPanel({ open, onToggle, messages, loading, error, confirmations, onAccept, onReject, input, onInputChange, onSend, hasApiKey, onOpenApiKeyModal }){
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, confirmations, loading]);
+
+  return (
+    <React.Fragment>
+      <button className="chat-fab" title="Ask the assistant" onClick={onToggle}>
+        {open ? '\u2715' : '\u2726'}
+      </button>
+      {open && (
+        <div className="chat-panel">
+          <div className="chat-panel__head">
+            <div>
+              <p className="panel__eyebrow">Scoped to tasks &amp; day planning</p>
+              <div style={{ fontFamily: 'var(--font-display)', fontSize: 16, fontWeight: 700 }}>Assistant</div>
+            </div>
+            <button className="icon-btn" title="Close" onClick={onToggle}>&times;</button>
+          </div>
+
+          {!hasApiKey ? (
+            <div className="chat-panel__body" style={{ justifyContent: 'center' }}>
+              <p style={{ fontSize: 13, lineHeight: 1.6 }}>
+                {hasApiKey === null ? 'Checking…' : "Connect your own Anthropic API key to use the assistant — usage is billed to whichever Anthropic account you connect, never to the app owner's."}
+              </p>
+              {hasApiKey === false && (
+                <button className="btn btn--amber" onClick={onOpenApiKeyModal} style={{ alignSelf: 'flex-start' }}>Connect API key</button>
+              )}
+            </div>
+          ) : (
+            <React.Fragment>
+              <div className="chat-panel__body" ref={scrollRef}>
+                {messages.length === 0 && confirmations.length === 0 && (
+                  <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                    Try: "What's overdue?", "Add a task to review the deck, due Friday", or "Plan my day".
+                  </p>
+                )}
+                {messages.map((m, i) => <ChatMessageBubble key={i} message={m} />)}
+                {confirmations.map(c => (
+                  <ChatConfirmCard key={c.id} confirmation={c} onAccept={onAccept} onReject={onReject} />
+                ))}
+                {loading && <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>Thinking…</p>}
+                {error && <p style={{ color: 'var(--red)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>{error}</p>}
+              </div>
+
+              <div className="chat-panel__input">
+                <input
+                  type="text"
+                  placeholder={confirmations.length > 0 ? 'Resolve the pending change above first…' : 'Ask or tell it what to do…'}
+                  value={input}
+                  disabled={loading || confirmations.length > 0}
+                  onChange={e => onInputChange(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') onSend(); }}
+                />
+                <button className="btn btn--amber" disabled={loading || confirmations.length > 0} onClick={onSend}>Send</button>
+              </div>
+              <div style={{ padding: '0 12px 10px', textAlign: 'right' }}>
+                <button className="icon-btn" title="Manage API key" onClick={onOpenApiKeyModal} style={{ fontSize: 10, width: 'auto', color: 'var(--text-faint)' }}>Manage key</button>
+              </div>
+            </React.Fragment>
+          )}
+        </div>
+      )}
+    </React.Fragment>
+  );
+}
+
 /* ============================== App ============================== */
 
 function App(){
@@ -2416,6 +2955,21 @@ function App(){
   const [activeTab, setActiveTab] = useState('overview');
   const [detailTaskId, setDetailTaskId] = useState(null);
   const [focusTaskId, setFocusTaskId] = useState(null);
+  const [dayPlanPreview, setDayPlanPreview] = useState(null);
+  const [dayPlanBaseline, setDayPlanBaseline] = useState(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState('');
+  const [chatConfirmations, setChatConfirmations] = useState([]);
+  const [pendingTurn, setPendingTurn] = useState(null);
+  const [hasApiKey, setHasApiKey] = useState(null);
+  const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
+  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+  const [apiKeyError, setApiKeyError] = useState('');
+  const chatMessagesRef = useRef([]);
+  useEffect(() => { chatMessagesRef.current = chatMessages; }, [chatMessages]);
   const [meetingDetailId, setMeetingDetailId] = useState(null);
   const [workingHours, setWorkingHours] = useState({});
   const [defaultWorkingHours, setDefaultWorkingHours] = useState({ start: '09:00', end: '18:00' });
@@ -2560,6 +3114,25 @@ function App(){
       setLoaded(true);
     })();
 
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  // Whether this user has connected their own Anthropic API key yet — checked by
+  // presence only, the raw key itself is never fetched back into the browser.
+  // null = still checking, so the chat panel doesn't flash the wrong state.
+  useEffect(() => {
+    if (!userId) { setHasApiKey(null); return; }
+    let cancelled = false;
+    supabaseClient
+      .from('user_api_keys')
+      .select('user_id')
+      .eq('user_id', userId)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) { console.error('API key status check failed', error); setHasApiKey(false); return; }
+        setHasApiKey(!!data);
+      });
     return () => { cancelled = true; };
   }, [userId]);
 
@@ -2742,6 +3315,295 @@ function App(){
     setDetailTaskId(id);
   }
 
+  /* ---------- Day Planner actions ---------- */
+  function buildDayPlanCtx(){
+    return { tasks, meetings, plannedMeetings, googleEvents, workingHours, defaultWorkingHours, oooRanges };
+  }
+  function planMyDay(variant){
+    const dateISO = todayISO();
+    const ctx = buildDayPlanCtx();
+    const preview = computeDayPlan(dateISO, ctx);
+    setDayPlanPreview({ dateISO, variant: variant || 'manual', ...preview });
+    setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx) });
+  }
+  // Shared by "Apply to calendar" / "Update plan" and the assistant's apply_day_plan tool.
+  // Regenerating for the same day only ever replaces this planner's own past output —
+  // anything placed by hand (no `source` tag) is left alone.
+  function commitDayPlan(dateISO, placements){
+    setPlannedMeetings(pm => {
+      const kept = pm.filter(m => !(m.kind === 'focus' && m.source === 'auto-plan' && m.date === dateISO));
+      const added = placements.map(p => ({
+        id: uid(), title: `Focus: ${p.taskTitle}`, date: p.date, time: p.time, duration: p.duration,
+        agenda: [], notes: '', kind: 'focus', taskId: p.taskId, source: 'auto-plan', planDate: dateISO
+      }));
+      return [...kept, ...added];
+    });
+  }
+  function applyDayPlanPreview(items){
+    if (!dayPlanPreview) return;
+    commitDayPlan(dayPlanPreview.dateISO, items || dayPlanPreview.placements);
+    setDayPlanPreview(null);
+  }
+  function goToTaskFromPlan(id){
+    setDayPlanPreview(null);
+    goToTask(id);
+  }
+  // "Delay" on a plan row means consciously pushing that task's own deadline to
+  // tomorrow (using the same revision-history mechanism as editing its due date
+  // anywhere else), not just hiding it from today's view.
+  function delayDayPlanTask(taskId){
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    reviseDueDate(taskId, isoOf(d));
+  }
+
+  // Re-checks whether today's plan is still current whenever plan-relevant state
+  // changes (a task's dates/estimate/status, a meeting added/moved, working hours,
+  // OOO). Debounced, and only once a baseline plan exists for today and no plan
+  // modal is already open, so it never interrupts active editing.
+  useEffect(() => {
+    if (!loaded || !dayPlanBaseline || dayPlanPreview) return;
+    const dateISO = todayISO();
+    if (dayPlanBaseline.dateISO !== dateISO) return;
+    const timer = setTimeout(() => {
+      const ctx = buildDayPlanCtx();
+      const currentSig = getDayPlanSignatureInputs(dateISO, ctx);
+      if (currentSig === dayPlanBaseline.signature) return;
+      const preview = computeDayPlan(dateISO, ctx);
+      setDayPlanPreview({ dateISO, variant: 'update', ...preview });
+      setDayPlanBaseline({ dateISO, signature: currentSig });
+    }, 1500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line
+  }, [tasks, meetings, plannedMeetings, googleEvents, workingHours, defaultWorkingHours, oooRanges, loaded, dayPlanBaseline, dayPlanPreview]);
+
+  /* ---------- Claude Assistant ---------- */
+  // BYOK: each person connects their own Anthropic API key before the assistant will
+  // respond for them. The key is written here but never read back into the browser —
+  // the hasApiKey check above only ever selects the row's existence, not its value.
+  async function saveAnthropicKey(key){
+    setApiKeyBusy(true);
+    setApiKeyError('');
+    try {
+      const { error } = await supabaseClient
+        .from('user_api_keys')
+        .upsert({ user_id: session.user.id, anthropic_api_key: key, updated_at: new Date().toISOString() });
+      if (error) throw error;
+      setHasApiKey(true);
+      setApiKeyModalOpen(false);
+    } catch (e) {
+      setApiKeyError(e.message || 'Could not save that key.');
+    } finally {
+      setApiKeyBusy(false);
+    }
+  }
+  async function removeAnthropicKey(){
+    setApiKeyBusy(true);
+    setApiKeyError('');
+    try {
+      const { error } = await supabaseClient.from('user_api_keys').delete().eq('user_id', session.user.id);
+      if (error) throw error;
+      setHasApiKey(false);
+      setApiKeyModalOpen(false);
+    } catch (e) {
+      setApiKeyError(e.message || 'Could not remove that key.');
+    } finally {
+      setApiKeyBusy(false);
+    }
+  }
+  function describeToolCall(name, input){
+    const t = input && input.taskId ? tasks.find(x => x.id === input.taskId) : null;
+    switch (name){
+      case 'create_task':
+        return `Create task "${input.title}"${input.endDate ? ` — due ${input.endDate}` : ''}`;
+      case 'update_task':
+        return `Update "${t ? t.title : input.taskId}"`;
+      case 'delete_task':
+        return `Delete task "${t ? t.title : input.taskId}"`;
+      case 'add_subtask':
+        return `Add sub-task "${input.title}" to "${t ? t.title : input.taskId}"`;
+      case 'toggle_subtask':
+        return `Toggle a sub-task on "${t ? t.title : input.taskId}"`;
+      case 'apply_day_plan':
+        return `Apply the previewed focus blocks to ${input && input.dateISO ? input.dateISO : todayISO()}'s calendar`;
+      default:
+        return name.replace(/_/g, ' ');
+    }
+  }
+
+  // Executes one tool call against real app state and returns a string result for
+  // Claude. Read tools return JSON; write tools return a short confirmation string.
+  // This function is only ever reached after either the tool is read-only, or the
+  // user has explicitly accepted the confirmation card for it.
+  function executeAssistantTool(name, input){
+    input = input || {};
+    switch (name){
+      case 'get_app_context': {
+        const dateISO = input.dateISO || todayISO();
+        const openTasks = tasks.filter(t => t.status !== 'done').map(t => ({
+          id: t.id, title: t.title, status: t.status, categoryId: t.theme,
+          startDate: t.startDate || null, endDate: t.endDate || null,
+          weight: t.weight || 1, estimatedDuration: t.estimatedDuration || null,
+          meetingId: t.meetingId || null, atRisk: !!t.atRisk
+        }));
+        const todaysMeetings = getMeetingsOnDate(dateISO, { meetings, plannedMeetings, googleEvents })
+          .map(m => ({ id: m.id, title: m.title, time: m.time, duration: m.duration }));
+        return JSON.stringify({
+          date: dateISO,
+          categories: categories.map(c => ({ id: c.id, title: c.title, code: c.code })),
+          openTasks, todaysMeetings,
+          workingHours: getWorkingHours(workingHours, defaultWorkingHours, dateISO),
+          outOfOffice: oooRanges[dateISO] || null
+        });
+      }
+      case 'create_task': {
+        const cat = categories.find(c => c.id === input.categoryId)
+          || categories.find(c => c.title.toLowerCase() === String(input.categoryId || '').toLowerCase());
+        if (!cat) return `Failed: no matching category "${input.categoryId}". Valid ids: ${categories.map(c => c.id).join(', ')}`;
+        const newTask = {
+          id: uid(), theme: cat.id, title: input.title, status: 'todo', atRisk: false,
+          startDate: input.startDate || '', endDate: input.endDate || '', notes: '', link: '', closingRemark: '',
+          weight: input.weight || 1, completedAt: '', estimatedDuration: input.estimatedDuration || null
+        };
+        setTasks(ts => [...ts, newTask]);
+        return `Created task "${input.title}" (id: ${newTask.id}) in ${cat.title}.`;
+      }
+      case 'update_task': {
+        const t = tasks.find(x => x.id === input.taskId);
+        if (!t) return `Failed: no task with id ${input.taskId}`;
+        if (input.endDate && input.endDate !== t.endDate) reviseDueDate(input.taskId, input.endDate);
+        if (input.status && input.status !== t.status) setTaskStatus(input.taskId, input.status);
+        const patch = {};
+        ['title', 'weight', 'estimatedDuration', 'startDate', 'notes', 'atRisk'].forEach(k => {
+          if (input[k] !== undefined) patch[k] = input[k];
+        });
+        if (Object.keys(patch).length) updateTask(input.taskId, patch);
+        return `Updated "${t.title}".`;
+      }
+      case 'delete_task': {
+        const t = tasks.find(x => x.id === input.taskId);
+        if (!t) return `Failed: no task with id ${input.taskId}`;
+        deleteTask(input.taskId);
+        return `Deleted "${t.title}".`;
+      }
+      case 'add_subtask': {
+        const t = tasks.find(x => x.id === input.taskId);
+        if (!t) return `Failed: no task with id ${input.taskId}`;
+        addSubtask(input.taskId, input.title, input.startDate || '', input.endDate || '');
+        return `Added sub-task "${input.title}" to "${t.title}".`;
+      }
+      case 'toggle_subtask': {
+        const t = tasks.find(x => x.id === input.taskId);
+        if (!t) return `Failed: no task with id ${input.taskId}`;
+        toggleSubtask(input.taskId, input.subtaskId);
+        return `Toggled sub-task on "${t.title}".`;
+      }
+      case 'preview_day_plan': {
+        const dateISO = input.dateISO || todayISO();
+        const ctx = buildDayPlanCtx();
+        const preview = computeDayPlan(dateISO, ctx);
+        setDayPlanPreview({ dateISO, variant: 'manual', ...preview });
+        setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx) });
+        return JSON.stringify({ dateISO, ...preview });
+      }
+      case 'apply_day_plan': {
+        const dateISO = input.dateISO || todayISO();
+        const ctx = buildDayPlanCtx();
+        const preview = (dayPlanPreview && dayPlanPreview.dateISO === dateISO)
+          ? dayPlanPreview
+          : { dateISO, ...computeDayPlan(dateISO, ctx) };
+        commitDayPlan(dateISO, preview.placements);
+        setDayPlanPreview(null);
+        return `Applied ${preview.placements.length} focus block(s) to ${dateISO}.`;
+      }
+      default:
+        return `Unknown tool: ${name}`;
+    }
+  }
+
+  // Sends a message array to the assistant Edge Function, handles any tool_use blocks
+  // in the reply (read tools execute immediately; write tools wait in chatConfirmations
+  // for the user), and — once every tool_use in the turn has a result — loops back
+  // automatically so Claude can see the outcome and keep going.
+  async function sendToAssistant(messagesToSend){
+    setChatLoading(true);
+    setChatError('');
+    try {
+      const { data } = await supabaseClient.auth.getSession();
+      const token = data && data.session && data.session.access_token;
+      const res = await fetch(`${window.SUPABASE_CONFIG.url}/functions/v1/assistant`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ messages: messagesToSend, tools: ASSISTANT_TOOLS })
+      });
+      const payload = await res.json();
+      if (!res.ok) {
+        if (payload.error === 'no_api_key') { setHasApiKey(false); setChatLoading(false); return; }
+        throw new Error(payload.error || `Assistant error (HTTP ${res.status})`);
+      }
+
+      const assistantMessage = { role: 'assistant', content: payload.content };
+      const nextMessages = [...messagesToSend, assistantMessage];
+      setChatMessages(nextMessages);
+
+      const toolUseBlocks = (payload.content || []).filter(b => b.type === 'tool_use');
+      setChatLoading(false);
+      if (toolUseBlocks.length === 0) return;
+
+      const results = {};
+      const writeBlocks = [];
+      toolUseBlocks.forEach(b => {
+        if (READ_ONLY_TOOLS.has(b.name)) results[b.id] = executeAssistantTool(b.name, b.input);
+        else writeBlocks.push(b);
+      });
+
+      if (writeBlocks.length === 0) {
+        const toolResultContent = toolUseBlocks.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: results[b.id] }));
+        sendToAssistant([...nextMessages, { role: 'user', content: toolResultContent }]);
+        return;
+      }
+
+      setChatConfirmations(writeBlocks.map(b => ({ id: b.id, name: b.name, input: b.input, description: describeToolCall(b.name, b.input) })));
+      setPendingTurn({ blocks: toolUseBlocks, results });
+    } catch (e) {
+      setChatError(e.message || 'Something went wrong reaching the assistant.');
+      setChatLoading(false);
+    }
+  }
+
+  function sendChatMessage(){
+    if (!chatInput.trim() || chatLoading || pendingTurn) return;
+    const next = [...chatMessages, { role: 'user', content: chatInput.trim() }];
+    setChatMessages(next);
+    setChatInput('');
+    sendToAssistant(next);
+  }
+
+  function resolveChatConfirmation(toolUseId, accepted){
+    const block = pendingTurn && pendingTurn.blocks.find(b => b.id === toolUseId);
+    if (!block) return;
+    let resultText;
+    if (accepted) {
+      try { resultText = executeAssistantTool(block.name, block.input); }
+      catch (e) { resultText = `Failed: ${e.message}`; }
+    } else {
+      resultText = 'The user declined this change.';
+    }
+    setChatConfirmations(cs => cs.filter(c => c.id !== toolUseId));
+    setPendingTurn(pt => (pt ? { ...pt, results: { ...pt.results, [toolUseId]: resultText } } : pt));
+  }
+
+  // Once every tool_use block in the in-flight turn has a result (auto-executed reads
+  // plus user-resolved writes), send them all back so the conversation continues.
+  useEffect(() => {
+    if (!pendingTurn) return;
+    const allDone = pendingTurn.blocks.every(b => pendingTurn.results[b.id] !== undefined);
+    if (!allDone) return;
+    const toolResultContent = pendingTurn.blocks.map(b => ({ type: 'tool_result', tool_use_id: b.id, content: pendingTurn.results[b.id] }));
+    setPendingTurn(null);
+    sendToAssistant([...chatMessagesRef.current, { role: 'user', content: toolResultContent }]);
+  }, [pendingTurn]);
+
   /* ---------- Meeting actions ---------- */
   function addMeeting(m){
     setMeetings(ms => [...ms, { ...m, id: uid() }]);
@@ -2803,9 +3665,17 @@ function App(){
     setWorkingHours(wh => ({ ...wh, [dateISO]: hours }));
   }
   function closeDailyPlanner(todayHours){
-    if (todayHours) setWorkingHoursForDate(todayISO(), todayHours);
-    setLastVisitDate(todayISO());
+    const dateISO = todayISO();
+    if (todayHours) setWorkingHoursForDate(dateISO, todayHours);
+    setLastVisitDate(dateISO);
     setDailyPlannerOpen(false);
+    // Use the just-picked hours directly rather than waiting on the state update,
+    // so the very first plan of the day reflects what was just set, not last night's.
+    const ctx = buildDayPlanCtx();
+    if (todayHours) ctx.workingHours = { ...ctx.workingHours, [dateISO]: todayHours };
+    const preview = computeDayPlan(dateISO, ctx);
+    setDayPlanPreview({ dateISO, variant: 'morning', ...preview });
+    setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx) });
   }
   function closeDigest(){
     if (new Date().getDay() === 5) setLastDigestWeek(isoOf(getMonday(new Date())));
@@ -2990,6 +3860,10 @@ function App(){
       {activeTab === 'overview' && (
         <React.Fragment>
           <AssistantBanner message={assistantMessage} />
+
+          <section className="panel" style={{ textAlign: 'center' }}>
+            <button className="btn btn--amber" onClick={() => planMyDay('manual')}>&#10022; Plan my day</button>
+          </section>
 
           <section className="stats-strip">
             <StatChip label="Meetings today" value={meetingsToday} tone="amber" onClick={() => setActiveTab('calendar')} />
@@ -3204,6 +4078,18 @@ function App(){
         />
       )}
 
+      {dayPlanPreview && (
+        <DayPlanModal
+          preview={dayPlanPreview}
+          categories={categories}
+          variant={dayPlanPreview.variant}
+          onApply={applyDayPlanPreview}
+          onClose={() => setDayPlanPreview(null)}
+          onGoToTask={goToTaskFromPlan}
+          onDelay={delayDayPlanTask}
+        />
+      )}
+
       {digestOpen && (
         <WeeklyDigestModal
           weekLabel={`Week of ${realMonday.getDate()} ${MONTHS[realMonday.getMonth()]}`}
@@ -3220,6 +4106,32 @@ function App(){
       {legacyImport && (
         <LegacyImportModal data={legacyImport} onImport={importLegacyData} onDiscard={discardLegacyData} />
       )}
+
+      <ChatPanel
+        open={chatOpen}
+        onToggle={() => setChatOpen(o => !o)}
+        messages={chatMessages}
+        loading={chatLoading}
+        error={chatError}
+        confirmations={chatConfirmations}
+        onAccept={id => resolveChatConfirmation(id, true)}
+        onReject={id => resolveChatConfirmation(id, false)}
+        input={chatInput}
+        onInputChange={setChatInput}
+        onSend={sendChatMessage}
+        hasApiKey={hasApiKey}
+        onOpenApiKeyModal={() => setApiKeyModalOpen(true)}
+      />
+
+      <ApiKeyModal
+        open={apiKeyModalOpen}
+        onClose={() => { setApiKeyModalOpen(false); setApiKeyError(''); }}
+        onSave={saveAnthropicKey}
+        onRemove={removeAnthropicKey}
+        hasKey={!!hasApiKey}
+        busy={apiKeyBusy}
+        error={apiKeyError}
+      />
 
       <p className="footnote">Synced to your account, private to {session.user.email} · a connected Google Calendar embed is only as private as your calendar's own sharing settings</p>
     </div>
