@@ -46,7 +46,7 @@ const TABS = [
   { id: 'overview',   label: 'Overview' },
   { id: 'calendar',   label: 'Calendar' },
   { id: 'tasks',      label: 'Task List' },
-  { id: 'quicklinks', label: 'Quick Links' }
+  { id: 'quicklinks', label: 'Doc Library' }
 ];
 
 const TASK_FILTERS = [
@@ -256,6 +256,32 @@ function getMeetingStatus(dateISO, time, duration){
   if (pct < 0) return { status: 'upcoming', pct: 0 };
   if (pct >= 75) return { status: 'wrapping', pct };
   return { status: 'live', pct };
+}
+
+function getMeetingDateTime(meeting){
+  if (!meeting || !meeting.date) return null;
+  const [h, m] = (meeting.time || '00:00').split(':').map(Number);
+  const d = new Date(meeting.date + 'T00:00:00');
+  d.setHours(h, m, 0, 0);
+  return d;
+}
+
+// A prep task's reminder should surface at whichever comes first: the start of the
+// meeting's working day, or 2 hours before the meeting itself — so an early meeting
+// still gives at least 2 hours' notice even if that falls before the day "starts".
+function getPrepReminderStatus(meeting, workingHours){
+  const meetingDT = getMeetingDateTime(meeting);
+  if (!meetingDT) return null;
+  const now = new Date();
+  if (now >= meetingDT) return null;
+
+  const twoHoursPrior = new Date(meetingDT.getTime() - 2 * 60 * 60 * 1000);
+  const dayStart = new Date(meetingDT);
+  const [sh, sm] = (workingHours.start || '09:00').split(':').map(Number);
+  dayStart.setHours(sh, sm, 0, 0);
+
+  const reminderTime = new Date(Math.min(dayStart.getTime(), twoHoursPrior.getTime()));
+  return { active: now >= reminderTime, meetingDT, reminderTime };
 }
 
 /* ---------- Time-lapsed within a day's working-hours window, OOO-aware ---------- */
@@ -1087,7 +1113,8 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
     setTitle(''); setDate(''); setOpen(false);
   }
 
-  const sorted = [...items].sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
+  const upcoming = items.filter(m => getMeetingStatus(m.date, m.time || '00:00', m.duration).status !== 'done');
+  const sorted = [...upcoming].sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`));
 
   return (
     <section className="panel">
@@ -1133,7 +1160,11 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
       </div>
 
       {sorted.length === 0 ? (
-        <p className="task-empty">No meetings scheduled yet — add one above, or promote something from "To Be Set Up".</p>
+        <p className="task-empty">
+          {items.length === 0
+            ? 'No meetings scheduled yet — add one above, or promote something from "To Be Set Up".'
+            : 'Nothing upcoming — completed meetings are hidden here.'}
+        </p>
       ) : (
         <div className="planned-meetings">
           {sorted.map(m => (
@@ -1148,7 +1179,43 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
 }
 
 
-function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onDelete }){
+function PrepTaskList({ meeting, prepTasks, categories, onAdd, onToggle, onDelete, onOpenTask }){
+  const [title, setTitle] = useState('');
+  const [categoryId, setCategoryId] = useState(categories[0] ? categories[0].id : '');
+
+  function submit(){
+    if (!title.trim() || !categoryId) return;
+    onAdd(categoryId, title.trim());
+    setTitle('');
+  }
+
+  return (
+    <div>
+      {prepTasks.length > 0 && (
+        <div className="subtask-list">
+          {prepTasks.map(t => (
+            <div key={t.id} className={`subtask-item${t.status === 'done' ? ' done' : ''}`}>
+              <input type="checkbox" checked={t.status === 'done'} onChange={() => onToggle(t.id)} />
+              <span className="subtask-item__title" style={{ cursor: 'pointer' }} onClick={() => onOpenTask(t.id)}>{t.title}</span>
+              <button className="icon-btn" title="Remove" onClick={() => onDelete(t.id)}>&times;</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="quick-add-row">
+        <input type="text" placeholder="Something to finish before this meeting…" value={title}
+          onChange={e => setTitle(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
+        <select value={categoryId} onChange={e => setCategoryId(e.target.value)}>
+          {categories.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
+        </select>
+        <button className="btn btn--amber" onClick={submit}>Add</button>
+      </div>
+    </div>
+  );
+}
+
+function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onDelete, onAddPrepTask, onTogglePrepTask, onDeletePrepTask, onOpenTask }){
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
     document.addEventListener('keydown', onKey);
@@ -1239,6 +1306,19 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
         </div>
 
         <div className="modal-field">
+          <label>Prep tasks &mdash; needed before this meeting</label>
+          <PrepTaskList
+            meeting={meeting}
+            prepTasks={tasks.filter(t => t.meetingId === meeting.id)}
+            categories={categories}
+            onAdd={(categoryId, title) => onAddPrepTask(meeting.id, categoryId, title, meeting.date)}
+            onToggle={onTogglePrepTask}
+            onDelete={onDeletePrepTask}
+            onOpenTask={onOpenTask}
+          />
+        </div>
+
+        <div className="modal-field">
           <label>Notes</label>
           <textarea className="modal-notes" rows={6} placeholder="Discussion notes, decisions, follow-ups…"
             value={meeting.notes || ''} onChange={e => onUpdate({ notes: e.target.value })} />
@@ -1253,7 +1333,7 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
   );
 }
 
-function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteTag }){
+function DocLibraryPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteTag, onRetag }){
   const [open, setOpen] = useState(false);
   const [label, setLabel] = useState('');
   const [url, setUrl] = useState('');
@@ -1283,15 +1363,15 @@ function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteT
   const filtered = activeTagFilter === 'all' ? links : links.filter(l => (l.tag || 'Quick Access') === activeTagFilter);
 
   return (
-    <section className="panel">
+    <section className="panel doc-library">
       <div className="panel__head">
         <div>
-          <p className="panel__eyebrow">External Feed</p>
-          <h2 className="panel__title">Quick Links · Docs &amp; Sheets</h2>
+          <p className="panel__eyebrow">Doc Library</p>
+          <h2 className="panel__title">Everything you keep coming back to</h2>
         </div>
         <div className="week-nav">
-          <button className="btn" onClick={() => setManageOpen(o => !o)}>Manage tags</button>
-          <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>+ Add link</button>
+          <button className="btn" onClick={() => setManageOpen(o => !o)}>Manage access types</button>
+          <button className="btn btn--amber" onClick={() => setOpen(o => !o)}>+ Add document</button>
         </div>
       </div>
 
@@ -1312,20 +1392,20 @@ function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteT
           </select>
         </div>
         <div>
-          <label>Tag</label>
+          <label>Access type</label>
           <select value={tag} onChange={e => setTag(e.target.value)}>
             {linkTags.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         </div>
         <div className="full">
           <button className="btn btn--ghost" onClick={() => setOpen(false)}>Cancel</button>
-          <button className="btn btn--amber" onClick={submit}>Add link</button>
+          <button className="btn btn--amber" onClick={submit}>Add document</button>
         </div>
       </div>
 
       <div className={`add-form${manageOpen ? ' open' : ''}`}>
         <div className="full" style={{ display: 'block', marginBottom: 4 }}>
-          <label>New tag</label>
+          <label>New access type</label>
           <div style={{ display: 'flex', gap: 8 }}>
             <input type="text" placeholder="e.g. Quick Access" value={newTagName}
               onChange={e => setNewTagName(e.target.value)}
@@ -1342,7 +1422,7 @@ function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteT
                   <span className="category-chip__title">{t}</span>
                   <span className="category-chip__count">{count}</span>
                   <button className="icon-btn" disabled={count > 0}
-                    title={count > 0 ? 'Retag its links first' : 'Delete tag'}
+                    title={count > 0 ? 'Move its documents to another access type first' : 'Delete access type'}
                     onClick={() => onDeleteTag(t)}>&times;</button>
                 </div>
               );
@@ -1359,20 +1439,23 @@ function QuickLinksPanel({ links, linkTags, onAdd, onDelete, onAddTag, onDeleteT
       </div>
 
       {filtered.length === 0 ? (
-        <p className="quick-links-empty" style={{ marginTop: 12 }}>No links here yet — add your PRD folder, sprint sheet, or any doc you open often.</p>
+        <p className="quick-links-empty" style={{ marginTop: 12 }}>Nothing filed here yet — add your PRD folder, sprint sheet, or any doc you open often.</p>
       ) : DOC_TYPE_ORDER.map(typeKey => {
         const typeLinks = filtered.filter(l => (l.type || detectDocType(l.url)) === typeKey);
         if (typeLinks.length === 0) return null;
         const meta = DOC_TYPE_META[typeKey];
         return (
-          <div key={typeKey} className="category-subgroup" style={{ marginTop: 14 }}>
-            <p className="category-subgroup__label">{meta.icon} {meta.label}</p>
-            <div className="quick-links">
+          <div key={typeKey} className="doc-folder">
+            <p className="doc-folder__label">&#128193; {meta.label} <span className="category-chip__count">{typeLinks.length}</span></p>
+            <div className="doc-folder-grid">
               {typeLinks.map(l => (
-                <div key={l.id} className="quick-link-chip">
-                  <a href={l.url} target="_blank" rel="noopener noreferrer">{l.label}</a>
-                  {l.tag && <span className="quick-link-chip__tag">{l.tag}</span>}
-                  <button title="Remove" onClick={() => onDelete(l.id)}>&times;</button>
+                <div key={l.id} className="doc-file-card">
+                  <div className="doc-file-card__icon">{meta.icon}</div>
+                  <a className="doc-file-card__name" href={l.url} target="_blank" rel="noopener noreferrer" title={l.label}>{l.label}</a>
+                  <select className="doc-file-card__tag" value={l.tag || linkTags[0] || ''} onChange={e => onRetag(l.id, e.target.value)}>
+                    {linkTags.map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                  <button className="doc-file-card__remove" title="Remove" onClick={() => onDelete(l.id)}>&times;</button>
                 </div>
               ))}
             </div>
@@ -2355,6 +2438,16 @@ function App(){
   function addTask(categoryId, title, startDate, endDate){
     setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: startDate || '', endDate: endDate || '', notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' }]);
   }
+  function addPrepTask(meetingId, categoryId, title, meetingDate){
+    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: '', endDate: meetingDate || '', notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', meetingId }]);
+  }
+  function togglePrepTask(taskId){
+    setTasks(ts => ts.map(t => {
+      if (t.id !== taskId) return t;
+      const nowDone = t.status !== 'done';
+      return { ...t, status: nowDone ? 'done' : 'todo', completedAt: nowDone ? todayISO() : '', atRisk: nowDone ? false : t.atRisk };
+    }));
+  }
   function updateTask(id, patch){
     setTasks(ts => ts.map(t => (t.id === id ? { ...t, ...patch } : t)));
   }
@@ -2401,6 +2494,9 @@ function App(){
   }
   function deleteQuickLink(id){
     setQuickLinks(qs => qs.filter(q => q.id !== id));
+  }
+  function retagQuickLink(id, tag){
+    setQuickLinks(qs => qs.map(q => (q.id === id ? { ...q, tag } : q)));
   }
   function addLinkTag(name){
     setLinkTags(ts => (ts.includes(name) ? ts : [...ts, name]));
@@ -2575,6 +2671,17 @@ function App(){
   const weekLapsed = computeWeekLapsed(workingHours, defaultWorkingHours, oooRanges, realMonday, today);
   const weekElapsedPercent = weekLapsed.percent;
 
+  const prepReminders = tasks
+    .filter(t => t.meetingId && t.status !== 'done')
+    .map(t => {
+      const meeting = plannedMeetings.find(m => m.id === t.meetingId);
+      if (!meeting) return null;
+      const hours = getWorkingHours(workingHours, defaultWorkingHours, meeting.date);
+      const info = getPrepReminderStatus(meeting, hours);
+      return info && info.active ? { task: t, meeting } : null;
+    })
+    .filter(Boolean);
+
   const greeting = getTimeGreeting(now.getHours());
   const assistantMessage = getAssistantMessage({ meetingsToday, tasksDueToday, atRiskCount, dailyProgress, timeElapsedPercent });
 
@@ -2636,6 +2743,23 @@ function App(){
                   <DeadlineChip key={t.id} task={t} category={categoryById(categories, t.theme)}
                     onClick={() => goToTask(t.id)}
                     onFocusClick={() => setFocusTaskId(t.id)} />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {prepReminders.length > 0 && (
+            <section className="panel deadlines-panel">
+              <div className="panel__head" style={{ marginBottom: 8 }}>
+                <p className="panel__eyebrow">Meeting Prep</p>
+              </div>
+              <div className="deadlines-strip">
+                {prepReminders.map(({ task, meeting }) => (
+                  <div key={task.id} className="deadline-chip" style={{ '--dchip-color': 'var(--amber)' }}
+                    onClick={() => goToTask(task.id)} role="button" tabIndex={0}>
+                    <span className="deadline-chip__title">{task.title}</span>
+                    <span className="deadline-chip__when">Before "{meeting.title}" &middot; {meeting.time}</span>
+                  </div>
                 ))}
               </div>
             </section>
@@ -2734,13 +2858,14 @@ function App(){
       )}
 
       {activeTab === 'quicklinks' && (
-        <QuickLinksPanel
+        <DocLibraryPanel
           links={quickLinks}
           linkTags={linkTags}
           onAdd={addQuickLink}
           onDelete={deleteQuickLink}
           onAddTag={addLinkTag}
           onDeleteTag={deleteLinkTag}
+          onRetag={retagQuickLink}
         />
       )}
 
@@ -2780,6 +2905,10 @@ function App(){
           onClose={() => setMeetingDetailId(null)}
           onUpdate={patch => updatePlannedMeeting(meetingDetailId, patch)}
           onDelete={() => deletePlannedMeeting(meetingDetailId)}
+          onAddPrepTask={addPrepTask}
+          onTogglePrepTask={togglePrepTask}
+          onDeletePrepTask={deleteTask}
+          onOpenTask={taskId => { setMeetingDetailId(null); setDetailTaskId(taskId); }}
         />
       )}
 
