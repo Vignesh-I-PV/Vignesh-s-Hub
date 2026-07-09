@@ -313,3 +313,107 @@ body{
 
 ::-webkit-scrollbar{width:8px; height:8px;}
 ::-webkit-scrollbar-thumb{background:var(--ink-700); border-radius:8px;}
+
+/* ============================== Claude Assistant chat panel ============================== */
+.chat-fab{
+  position:fixed;
+  bottom:24px;
+  right:24px;
+  width:52px;
+  height:52px;
+  border-radius:50%;
+  border:none;
+  background:var(--amber);
+  color:var(--ink-950);
+  font-size:20px;
+  cursor:pointer;
+  box-shadow:0 6px 20px rgba(0,0,0,.35);
+  z-index:1000;
+  transition:transform .1s, filter .15s;
+}
+.chat-fab:hover{filter:brightness(1.08);}
+.chat-fab:active{transform:scale(.96);}
+
+.chat-panel{
+  position:fixed;
+  bottom:88px;
+  right:24px;
+  width:360px;
+  max-width:calc(100vw - 32px);
+  height:520px;
+  max-height:calc(100vh - 120px);
+  display:flex;
+  flex-direction:column;
+  background:var(--ink-900);
+  border:1px solid var(--line);
+  border-radius:12px;
+  box-shadow:0 12px 40px rgba(0,0,0,.45);
+  z-index:1000;
+  overflow:hidden;
+}
+.chat-panel__head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  padding:14px 16px;
+  border-bottom:1px solid var(--line);
+}
+.chat-panel__body{
+  flex:1;
+  overflow-y:auto;
+  padding:14px 16px;
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+}
+.chat-panel__input{
+  display:flex;
+  gap:8px;
+  padding:12px;
+  border-top:1px solid var(--line);
+}
+.chat-panel__input input{flex:1; min-width:0;}
+
+.chat-bubble{
+  max-width:88%;
+  padding:8px 12px;
+  border-radius:10px;
+  font-size:13px;
+  line-height:1.5;
+}
+.chat-bubble p{margin:0;}
+.chat-bubble p + p{margin-top:6px;}
+.chat-bubble--user{align-self:flex-end; background:var(--amber-dim);}
+.chat-bubble--assistant{align-self:flex-start; background:var(--ink-800); border:1px solid var(--line);}
+.chat-bubble__tool-chip{
+  display:inline-block;
+  margin-top:4px;
+  font-family:var(--font-mono);
+  font-size:10px;
+  color:var(--text-lo);
+  background:var(--ink-700);
+  border-radius:6px;
+  padding:2px 8px;
+}
+
+.chat-confirm-card{
+  align-self:stretch;
+  border:1px solid var(--amber);
+  background:var(--amber-dim);
+  border-radius:10px;
+  padding:10px 12px;
+}
+.chat-confirm-card--danger{border-color:var(--red); background:var(--red-dim);}
+.chat-confirm-card__desc{margin:0 0 8px; font-size:13px; color:var(--text-hi);}
+.chat-confirm-card__actions{display:flex; gap:8px; justify-content:flex-end;}
+
+/* ============================== Interactive day-plan rows ============================== */
+/* Rearrange (time/duration), remove, or delay a suggested block right in the modal. */
+.today-item--editable{
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:8px;
+}
+.today-item--editable select{font-size:12px;}
+.today-item--editable .today-item__title{flex:1 1 140px;}
