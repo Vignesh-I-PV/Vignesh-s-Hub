@@ -33,12 +33,12 @@ const DEFAULT_CATEGORIES = [
   { id: 'testing',   code: 'CH-04', title: 'Testing & Bug Fixes',       ...colorForIndex(3) }
 ];
 
-const MEETING_TYPES = {
-  pod:      { label: 'POD Connect',     color: 'var(--cyan)',   dim: 'var(--cyan-dim)' },
-  mentor:   { label: 'Mentor Sync',     color: 'var(--amber)',  dim: 'var(--amber-dim)' },
-  champion: { label: 'Champion Review', color: 'var(--purple)', dim: 'var(--purple-dim)' },
-  sprint:   { label: 'Sprint Call',     color: 'var(--green)',  dim: 'var(--green-dim)' }
-};
+const DEFAULT_MEETING_TYPES = [
+  { id: 'pod',      label: 'POD Connect',     color: 'var(--cyan)',   dim: 'var(--cyan-dim)' },
+  { id: 'mentor',   label: 'Mentor Sync',     color: 'var(--amber)',  dim: 'var(--amber-dim)' },
+  { id: 'champion', label: 'Champion Review', color: 'var(--purple)', dim: 'var(--purple-dim)' },
+  { id: 'sprint',   label: 'Sprint Call',     color: 'var(--green)',  dim: 'var(--green-dim)' }
+];
 
 const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -113,10 +113,10 @@ const ASSISTANT_TOOLS = [
   },
   {
     name: 'add_subtask',
-    description: 'Add a sub-task to an existing task.',
+    description: "Add a sub-task to an existing task. The parent task's own start/end dates are automatically rolled up from its sub-tasks (earliest start, latest end) once any exist. Give it estimatedDurationMinutes if the user mentions how long it'll take — the day planner schedules sub-tasks individually and skips ones with no estimate.",
     input_schema: {
       type: 'object',
-      properties: { taskId: { type: 'string' }, title: { type: 'string' }, startDate: { type: 'string' }, endDate: { type: 'string' } },
+      properties: { taskId: { type: 'string' }, title: { type: 'string' }, startDate: { type: 'string' }, endDate: { type: 'string' }, estimatedDurationMinutes: { type: 'number' } },
       required: ['taskId', 'title']
     }
   },
@@ -161,9 +161,36 @@ function taskAppearsOn(task, dateISO){
   return taskMatchesRange(task, dateISO, dateISO);
 }
 
+// Strict due-today-or-overdue check, distinct from taskAppearsOn above. taskAppearsOn
+// intentionally has no upper bound for pending tasks (so a task shows across its whole
+// active span in week/month views); this one is for contexts that specifically mean
+// "is this actually due by dateISO" — the Overview stat and the day planner's tiering —
+// so a task whose due date got pushed to the future is correctly excluded from "today".
+function isDueOrOverdue(task, dateISO){
+  const e = task.endDate || task.startDate;
+  if (!e) return false;
+  return e <= dateISO;
+}
+
+// Sub-task-aware version of the above. A task's own start/end are rolled up to the
+// earliest/latest across all its sub-tasks (see rollUpTaskDates), so checking only
+// the parent's dates would hide a task that has one sub-task due today and another
+// due next month (the roll-up's latest end date is next month). Instead, when a task
+// has sub-tasks, it counts as due today/overdue if ANY not-done sub-task is.
+function taskIsDueTodayOrOverdue(task, dateISO){
+  const subtasks = task.subtasks || [];
+  if (subtasks.length === 0) return isDueOrOverdue(task, dateISO);
+  return subtasks.some(s => {
+    if (s.done) return false;
+    const e = s.endDate || s.startDate || task.endDate || task.startDate;
+    if (!e) return false;
+    return e <= dateISO;
+  });
+}
+
 function matchesTaskFilter(task, filter, today, weekStart, weekEnd, monthStart, monthEnd){
   if (filter === 'all') return true;
-  if (filter === 'today') return taskMatchesRange(task, today, today);
+  if (filter === 'today') return task.status === 'done' ? taskMatchesRange(task, today, today) : taskIsDueTodayOrOverdue(task, today);
   if (filter === 'week') return taskMatchesRange(task, weekStart, weekEnd);
   if (filter === 'month') return taskMatchesRange(task, monthStart, monthEnd);
   return true;
@@ -274,6 +301,16 @@ function categoryById(categories, id){
   return categories.find(c => c.id === id);
 }
 
+const GENERAL_MEETING_TYPE = { id: 'other', label: 'General', color: 'var(--purple)', dim: 'var(--purple-dim)' };
+
+// Looks up a meeting type by id from the user's managed list, falling back to the
+// fixed 'General' pseudo-type for 'other', unset, or a type that's since been deleted
+// (so old meetings referencing a since-removed type still render sensibly).
+function meetingTypeById(meetingTypes, id){
+  if (!id || id === 'other') return GENERAL_MEETING_TYPE;
+  return (meetingTypes || []).find(t => t.id === id) || GENERAL_MEETING_TYPE;
+}
+
 // Once a task's deadline has been consciously revised, we show "Extended" instead of
 // treating it as overdue/delayed — the person made a deliberate call, it isn't slipping
 // silently. If it's never been revised, fall back to the normal due-soon/overdue read.
@@ -368,12 +405,17 @@ function computeProgress(tasks, filterFn){
 
 // A sub-task can never start before, or end after, its parent task's own dates —
 // it can only be a tighter window within the parent's timeline.
-function clampSubtaskDates(task, startDate, endDate){
-  let s = startDate || '';
-  let e = endDate || '';
-  if (task.startDate && s && s < task.startDate) s = task.startDate;
-  if (task.endDate && e && e > task.endDate) e = task.endDate;
-  return { startDate: s, endDate: e };
+// Once a task has sub-tasks, its own start/end are derived from them: earliest
+// sub-task start becomes the task's start, latest sub-task end becomes the task's
+// end. Returns null if no sub-task has any date set yet (nothing to roll up).
+function rollUpTaskDates(subtasks){
+  const starts = (subtasks || []).map(s => s.startDate).filter(Boolean);
+  const ends = (subtasks || []).map(s => s.endDate).filter(Boolean);
+  if (starts.length === 0 && ends.length === 0) return null;
+  return {
+    startDate: starts.length ? starts.reduce((a, b) => (a < b ? a : b)) : '',
+    endDate: ends.length ? ends.reduce((a, b) => (a > b ? a : b)) : ''
+  };
 }
 
 /* ---------- Meeting completion / in-progress status ---------- */
@@ -555,43 +597,85 @@ function computeDayPlan(dateISO, ctx){
   const meetingsOnDate = getMeetingsOnDate(dateISO, ctx);
   const meetingById = new Map(meetingsOnDate.filter(m => m.kind !== 'recurring').map(m => [m.id, m]));
 
-  const candidates = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, dateISO));
-  const missingDuration = candidates.filter(t => !t.estimatedDuration);
-  const schedulable = candidates.filter(t => t.estimatedDuration);
+  // Builds the flat list of schedulable units for dateISO. A task with sub-tasks
+  // schedules each not-done sub-task individually (its own dates/duration); a task
+  // with no sub-tasks schedules as a single unit, same as before.
+  const schedulable = [];
+  const missingDuration = [];
+  tasks.forEach(t => {
+    if (t.status === 'done') return;
+    const subtasks = t.subtasks || [];
+    if (subtasks.length > 0) {
+      subtasks.forEach(s => {
+        if (s.done) return;
+        const startDate = s.startDate || t.startDate || '';
+        const endDate = s.endDate || t.endDate || '';
+        if (!taskMatchesRange({ startDate, endDate, status: 'todo' }, dateISO, dateISO)) return;
+        if (!s.estimatedDuration) {
+          missingDuration.push({ id: t.id, title: `${t.title} — ${s.title}` });
+          return;
+        }
+        schedulable.push({
+          taskId: t.id, subtaskId: s.id, title: s.title, displayTitle: `${t.title} — ${s.title}`,
+          theme: t.theme, meetingId: t.meetingId, weight: t.weight,
+          startDate, endDate, estimatedDuration: s.estimatedDuration
+        });
+      });
+    } else {
+      if (!taskAppearsOn(t, dateISO)) return;
+      if (!t.estimatedDuration) {
+        missingDuration.push({ id: t.id, title: t.title });
+        return;
+      }
+      schedulable.push({
+        taskId: t.id, subtaskId: null, title: t.title, displayTitle: t.title,
+        theme: t.theme, meetingId: t.meetingId, weight: t.weight,
+        startDate: t.startDate, endDate: t.endDate, estimatedDuration: t.estimatedDuration
+      });
+    }
+  });
 
   const prepTier = [];
   const todayTier = [];
   const backlogTier = [];
-  schedulable.forEach(t => {
-    const meeting = t.meetingId ? meetingById.get(t.meetingId) : null;
+  const futureTier = [];
+  schedulable.forEach(u => {
+    const meeting = u.meetingId ? meetingById.get(u.meetingId) : null;
     if (meeting) {
-      prepTier.push({ task: t, tier: 'prep', deadline: minutesSinceMidnight(meeting.time || '00:00') - PREP_BUFFER_MINUTES, meetingTitle: meeting.title });
-    } else if (t.endDate && t.endDate < dateISO) {
-      backlogTier.push({ task: t, tier: 'backlog' });
+      prepTier.push({ unit: u, tier: 'prep', deadline: minutesSinceMidnight(meeting.time || '00:00') - PREP_BUFFER_MINUTES, meetingTitle: meeting.title });
+    } else if (u.endDate && u.endDate < dateISO) {
+      backlogTier.push({ unit: u, tier: 'backlog' });
+    } else if (u.endDate && u.endDate > dateISO) {
+      futureTier.push({ unit: u, tier: 'future' });
     } else {
-      todayTier.push({ task: t, tier: 'today' });
+      todayTier.push({ unit: u, tier: 'today' });
     }
   });
   prepTier.sort((a, b) => a.deadline - b.deadline);
-  todayTier.sort((a, b) => {
-    const aEnd = a.task.endDate || '9999-99-99';
-    const bEnd = b.task.endDate || '9999-99-99';
+  const byNearestEndThenWeight = (a, b) => {
+    const aEnd = a.unit.endDate || '9999-99-99';
+    const bEnd = b.unit.endDate || '9999-99-99';
     if (aEnd !== bEnd) return aEnd < bEnd ? -1 : 1;
-    return (b.task.weight || 1) - (a.task.weight || 1);
-  });
+    return (b.unit.weight || 1) - (a.unit.weight || 1);
+  };
+  todayTier.sort(byNearestEndThenWeight);
+  futureTier.sort(byNearestEndThenWeight);
   // Backlog: simple oldest-first by how long-breached the deadline is — no weight
   // tie-break, on purpose, per the "keep it simple" call.
-  backlogTier.sort((a, b) => (a.task.endDate < b.task.endDate ? -1 : a.task.endDate > b.task.endDate ? 1 : 0));
+  backlogTier.sort((a, b) => (a.unit.endDate < b.unit.endDate ? -1 : a.unit.endDate > b.unit.endDate ? 1 : 0));
 
-  const ordered = [...prepTier, ...todayTier, ...backlogTier];
+  // Order: meeting-prep (hard constraint) first, then what's actually due today,
+  // then backlog (already overdue) — ahead of tasks that aren't due yet — and only
+  // then future-dated tasks get whatever time is left over.
+  const ordered = [...prepTier, ...todayTier, ...backlogTier, ...futureTier];
 
   const free = getFreeIntervals(dateISO, ctx);
   const placements = [];
   const unfit = [];
 
   ordered.forEach(entry => {
-    const { task, deadline, meetingTitle, tier } = entry;
-    let remaining = task.estimatedDuration;
+    const { unit, deadline, meetingTitle, tier } = entry;
+    let remaining = unit.estimatedDuration;
 
     for (let i = 0; i < free.length && remaining > 0; i++){
       const original = free[i];
@@ -603,9 +687,9 @@ function computeDayPlan(dateISO, ctx){
       if (take < MIN_CHUNK_MINUTES && remaining > MIN_CHUNK_MINUTES) continue;
 
       placements.push({
-        taskId: task.id, taskTitle: task.title, theme: task.theme,
+        taskId: unit.taskId, subtaskId: unit.subtaskId, taskTitle: unit.displayTitle, theme: unit.theme,
         date: dateISO, time: minutesToTime(s), duration: take,
-        meetingId: task.meetingId || null, meetingTitle: meetingTitle || null,
+        meetingId: unit.meetingId || null, meetingTitle: meetingTitle || null,
         tier
       });
       remaining -= take;
@@ -617,8 +701,8 @@ function computeDayPlan(dateISO, ctx){
 
     if (remaining > 0) {
       unfit.push({
-        taskId: task.id, taskTitle: task.title, remaining, tier,
-        reason: deadline !== undefined ? `Not enough free time before "${meetingTitle}"` : (tier === 'backlog' ? 'No leftover time today' : 'Not enough free time today')
+        taskId: unit.taskId, subtaskId: unit.subtaskId, taskTitle: unit.displayTitle, remaining, tier,
+        reason: deadline !== undefined ? `Not enough free time before "${meetingTitle}"` : (tier === 'backlog' ? 'No leftover time today' : tier === 'future' ? 'No leftover time today (not due yet)' : 'Not enough free time today')
       });
     }
   });
@@ -635,7 +719,12 @@ function computeDayPlan(dateISO, ctx){
 function getDayPlanSignatureInputs(dateISO, ctx){
   const relevantTasks = ctx.tasks
     .filter(t => t.status !== 'done' && taskAppearsOn(t, dateISO))
-    .map(t => `${t.id}:${t.estimatedDuration || 0}:${t.startDate || ''}:${t.endDate || ''}:${t.meetingId || ''}:${t.weight || 1}`)
+    .map(t => {
+      const subSig = (t.subtasks || [])
+        .map(s => `${s.id}:${s.done ? 1 : 0}:${s.estimatedDuration || 0}:${s.startDate || ''}:${s.endDate || ''}`)
+        .sort().join(',');
+      return `${t.id}:${t.estimatedDuration || 0}:${t.startDate || ''}:${t.endDate || ''}:${t.meetingId || ''}:${t.weight || 1}:[${subSig}]`;
+    })
     .sort();
   const meetingsToday = getMeetingsOnDate(dateISO, ctx)
     .filter(m => !(m.kind === 'focus' && m.source === 'auto-plan'))
@@ -643,6 +732,17 @@ function getDayPlanSignatureInputs(dateISO, ctx){
     .sort();
   const hours = getWorkingHours(ctx.workingHours, ctx.defaultWorkingHours, dateISO);
   return JSON.stringify({ relevantTasks, meetingsToday, hours, ooo: ctx.oooRanges[dateISO] || null });
+}
+
+// Fingerprints a computed plan's actual output (placements + what didn't fit), so the
+// change-detection watcher can tell a real change in the plan apart from an input change
+// that happens to recompute to the same result — and skip the popup in the latter case.
+function fingerprintDayPlan(preview){
+  if (!preview) return '';
+  const placements = (preview.placements || []).map(p => `${p.taskId}:${p.subtaskId || ''}:${p.time}:${p.duration}`).sort().join('|');
+  const unfit = (preview.unfit || []).map(u => `${u.taskId}:${u.subtaskId || ''}:${u.remaining}`).sort().join('|');
+  const missing = (preview.missingDuration || []).map(t => t.id).sort().join('|');
+  return `${placements}::${unfit}::${missing}`;
 }
 
 
@@ -727,7 +827,7 @@ function AssistantBanner({ message }){
   );
 }
 
-function StickyNotesPanel({ notes, onAdd, onDelete }){
+function StickyNotesPanel({ notes, onAdd, onDelete, onFile }){
   const [text, setText] = useState('');
 
   function submit(){
@@ -755,7 +855,8 @@ function StickyNotesPanel({ notes, onAdd, onDelete }){
           {notes.map(n => (
             <div key={n.id} className="sticky-note">
               <span>{n.text}</span>
-              <button className="icon-btn" title="Filed elsewhere — remove" onClick={() => onDelete(n.id)}>&times;</button>
+              <button className="btn" style={{ fontSize: 10, padding: '4px 8px' }} onClick={() => onFile(n.id)}>File this</button>
+              <button className="icon-btn" title="Discard" onClick={() => onDelete(n.id)}>&times;</button>
             </div>
           ))}
         </div>
@@ -764,7 +865,7 @@ function StickyNotesPanel({ notes, onAdd, onDelete }){
   );
 }
 
-function EndOfDayModal({ notes, onClose }){
+function EndOfDayModal({ notes, onClose, onFile }){
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-panel" style={{ maxWidth: 460 }} onClick={e => e.stopPropagation()}>
@@ -776,14 +877,98 @@ function EndOfDayModal({ notes, onClose }){
         </div>
         <div className="modal-field">
           <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 10 }}>
-            Move these into a task, a meeting's notes, or wherever they belong — otherwise they'll remind you again first thing tomorrow.
+            Move these into a task, a meeting's agenda, or wherever they belong — otherwise they'll remind you again first thing tomorrow.
           </p>
           <div className="sticky-note-list">
-            {notes.map(n => <div key={n.id} className="sticky-note"><span>{n.text}</span></div>)}
+            {notes.map(n => (
+              <div key={n.id} className="sticky-note">
+                <span>{n.text}</span>
+                <button className="btn" style={{ fontSize: 10, padding: '4px 8px' }} onClick={() => onFile(n.id)}>File this</button>
+              </div>
+            ))}
           </div>
         </div>
         <div className="modal-footer">
           <button className="btn btn--amber" onClick={onClose} style={{ marginLeft: 'auto' }}>Got it</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Chooser shown when a quick note is being filed: standalone task, a task under a
+// specific meeting (prep task), or an agenda item on a specific meeting.
+function FileNoteModal({ note, meetings, categories, onClose, onFileAgenda, onFilePrepTask, onFileTask }){
+  const [dest, setDest] = useState('task');
+  const [meetingId, setMeetingId] = useState(meetings[0] ? meetings[0].id : '');
+  const [categoryId, setCategoryId] = useState(categories[0] ? categories[0].id : '');
+
+  useEffect(() => {
+    function onKey(e){ if (e.key === 'Escape') onClose(); }
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  if (!note) return null;
+
+  function submit(){
+    if (dest === 'task') {
+      if (!categoryId) return;
+      onFileTask(categoryId);
+    } else if (dest === 'agenda') {
+      if (!meetingId) return;
+      onFileAgenda(meetingId);
+    } else if (dest === 'prep') {
+      if (!meetingId || !categoryId) return;
+      onFilePrepTask(meetingId, categoryId);
+    }
+  }
+
+  const needsMeeting = dest === 'agenda' || dest === 'prep';
+  const needsCategory = dest === 'task' || dest === 'prep';
+  const canSubmit = (!needsMeeting || !!meetingId) && (!needsCategory || !!categoryId);
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-panel" style={{ maxWidth: 440 }} onClick={e => e.stopPropagation()}>
+        <div className="modal-panel__head">
+          <div style={{ flex: 1 }}>
+            <p className="panel__eyebrow">File this note</p>
+            <div style={{ fontFamily: 'var(--font-display)', fontSize: 16, fontWeight: 600, marginTop: 2 }}>{note.text}</div>
+          </div>
+          <button className="icon-btn" title="Close" onClick={onClose}>&times;</button>
+        </div>
+        <div className="modal-field">
+          <label>File as</label>
+          <div className="segmented">
+            <button className={`segmented__opt${dest === 'task' ? ' is-active' : ''}`} onClick={() => setDest('task')}>Standalone task</button>
+            <button className={`segmented__opt${dest === 'prep' ? ' is-active' : ''}`} onClick={() => setDest('prep')}>Task under a meeting</button>
+            <button className={`segmented__opt${dest === 'agenda' ? ' is-active' : ''}`} onClick={() => setDest('agenda')}>Agenda item on a meeting</button>
+          </div>
+        </div>
+        {needsMeeting && (
+          <div className="modal-field">
+            <label>Meeting</label>
+            {meetings.length === 0 ? (
+              <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)' }}>No scheduled meetings to attach this to yet.</p>
+            ) : (
+              <select value={meetingId} onChange={e => setMeetingId(e.target.value)}>
+                {meetings.map(m => <option key={m.id} value={m.id}>{m.date} &middot; {m.title}</option>)}
+              </select>
+            )}
+          </div>
+        )}
+        {needsCategory && (
+          <div className="modal-field">
+            <label>Category</label>
+            <select value={categoryId} onChange={e => setCategoryId(e.target.value)}>
+              {categories.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
+            </select>
+          </div>
+        )}
+        <div className="modal-footer">
+          <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn--amber" onClick={submit} disabled={!canSubmit}>File it</button>
         </div>
       </div>
     </div>
@@ -855,10 +1040,11 @@ function DeadlineChip({ task, category, onClick, onFocusClick }){
   );
 }
 
-function FocusTimeModal({ task, onClose, onSave }){
-  const [date, setDate] = useState(todayISO());
-  const [time, setTime] = useState('10:00');
-  const [duration, setDuration] = useState(30);
+function FocusTimeModal({ task, initial, onClose, onSave, onDelete }){
+  const isEdit = !!initial;
+  const [date, setDate] = useState(initial ? initial.date : todayISO());
+  const [time, setTime] = useState(initial ? (initial.time || '10:00') : '10:00');
+  const [duration, setDuration] = useState(initial ? (initial.duration || 30) : 30);
 
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
@@ -893,20 +1079,23 @@ function FocusTimeModal({ task, onClose, onSave }){
           </div>
         </div>
         <div className="modal-footer">
+          {isEdit && onDelete && (
+            <button className="btn btn--ghost" style={{ color: 'var(--red)', marginRight: 'auto' }} onClick={onDelete}>Remove</button>
+          )}
           <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
-          <button className="btn btn--amber" onClick={() => onSave(date, time, duration)}>Add to calendar</button>
+          <button className="btn btn--amber" onClick={() => onSave(date, time, duration)}>{isEdit ? 'Save changes' : 'Add to calendar'}</button>
         </div>
       </div>
     </div>
   );
 }
 
-function TodayMeetingsCard({ meetings, plannedMeetings, googleEvents, pendingMeetings, todayIdx, realParity, onClickMeeting }){
+function TodayMeetingsCard({ meetings, plannedMeetings, googleEvents, pendingMeetings, todayIdx, realParity, onClickMeeting, meetingTypes }){
   const today = todayISO();
   const todayRecurring = meetings
     .filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity))
     .sort((a, b) => a.time.localeCompare(b.time));
-  const todayPlanned = plannedMeetings.filter(m => m.date === today).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+  const todayPlanned = plannedMeetings.filter(m => m.date === today && m.kind !== 'focus').sort((a, b) => (a.time || '').localeCompare(b.time || ''));
   const todayGoogle = (googleEvents || []).filter(m => m.date === today).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
   const todayReminders = pendingMeetings.filter(m => needsReminder(m, today));
   const nothing = todayRecurring.length === 0 && todayPlanned.length === 0 && todayGoogle.length === 0 && todayReminders.length === 0;
@@ -924,7 +1113,7 @@ function TodayMeetingsCard({ meetings, plannedMeetings, googleEvents, pendingMee
       ) : (
         <div className="today-list">
           {todayRecurring.map(m => {
-            const mt = MEETING_TYPES[m.type];
+            const mt = meetingTypeById(meetingTypes, m.type);
             const status = getMeetingStatus(today, m.time, m.duration);
             return (
               <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': mt.color }} onClick={onClickMeeting}>
@@ -935,15 +1124,12 @@ function TodayMeetingsCard({ meetings, plannedMeetings, googleEvents, pendingMee
             );
           })}
           {todayPlanned.map(m => {
-            const isFocus = m.kind === 'focus';
-            const color = isFocus ? 'var(--green)' : 'var(--purple)';
-            const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
             const status = getMeetingStatus(today, m.time || '00:00', m.duration);
             return (
-              <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': color }} onClick={onClickMeeting}>
+              <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': 'var(--purple)' }} onClick={onClickMeeting}>
                 <span className="today-item__time">{m.time || '—'}</span>
                 <span className="today-item__title">{m.title}</span>
-                {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>}
+                {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': 'var(--purple)', '--pill-bg': 'var(--purple-dim)' }}>Meeting</span>}
               </div>
             );
           })}
@@ -972,7 +1158,7 @@ function TodayMeetingsCard({ meetings, plannedMeetings, googleEvents, pendingMee
 
 function TodayTasksCard({ tasks, categories, onClickTask }){
   const today = todayISO();
-  const todayTasks = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today));
+  const todayTasks = tasks.filter(t => t.status !== 'done' && taskIsDueTodayOrOverdue(t, today));
 
   return (
     <section className="panel">
@@ -1005,9 +1191,45 @@ function TodayTasksCard({ tasks, categories, onClickTask }){
   );
 }
 
-function AddMeetingForm({ open, onCancel, onSubmit }){
+// Focus Time blocks are task-work, not meetings — they get their own Today card
+// (paired with Tasks) instead of being mixed into the Meetings list.
+function TodayFocusCard({ plannedMeetings, onClickFocus }){
+  const today = todayISO();
+  const todayFocus = (plannedMeetings || [])
+    .filter(m => m.kind === 'focus' && m.date === today)
+    .sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+
+  return (
+    <section className="panel">
+      <div className="panel__head" style={{ marginBottom: 10 }}>
+        <div>
+          <p className="panel__eyebrow">Today</p>
+          <h2 className="panel__title">Focus Time</h2>
+        </div>
+      </div>
+      {todayFocus.length === 0 ? (
+        <p style={{ color: 'var(--text-lo)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>No focus blocks today.</p>
+      ) : (
+        <div className="today-list">
+          {todayFocus.map(m => {
+            const status = getMeetingStatus(today, m.time || '00:00', m.duration);
+            return (
+              <div key={m.id} className={`today-item${status.status === 'done' ? ' is-complete' : ''}`} onClick={() => onClickFocus(m.id)}>
+                <span className="today-item__time">{m.time || '—'}</span>
+                <span className="today-item__title">{m.title}</span>
+                {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': 'var(--green)', '--pill-bg': 'var(--green-dim)' }}>{formatDuration(m.duration || 30)}</span>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AddMeetingForm({ open, onCancel, onSubmit, meetingTypes }){
   const [name, setName] = useState('');
-  const [type, setType] = useState('pod');
+  const [type, setType] = useState(meetingTypes[0] ? meetingTypes[0].id : 'other');
   const [weekday, setWeekday] = useState(0);
   const [time, setTime] = useState('10:00');
   const [duration, setDuration] = useState(30);
@@ -1029,10 +1251,8 @@ function AddMeetingForm({ open, onCancel, onSubmit }){
       <div>
         <label>Type</label>
         <select value={type} onChange={e => setType(e.target.value)}>
-          <option value="pod">POD Connect</option>
-          <option value="mentor">Mentor Sync</option>
-          <option value="champion">Champion Review</option>
-          <option value="sprint">Sprint Call</option>
+          <option value="other">General</option>
+          {meetingTypes.map(mt => <option key={mt.id} value={mt.id}>{mt.label}</option>)}
         </select>
       </div>
       <div>
@@ -1122,18 +1342,36 @@ function DayHoursPanel({ iso, workingHours, defaultWorkingHours, oooRanges, onSe
   );
 }
 
-function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvents, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting, workingHours, defaultWorkingHours, oooRanges, onSetWorkingHours, onToggleFullDayOOO, onAddOOOBlock, onDeleteOOOBlock }){
+function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvents, tasks, meetingTypes, weekOffset, setWeekOffset, onDeleteMeeting, onDeletePlanned, onOpenMeeting, addOpen, setAddOpen, onAddMeeting, workingHours, defaultWorkingHours, oooRanges, onSetWorkingHours, onToggleFullDayOOO, onAddOOOBlock, onDeleteOOOBlock, onAddMeetingType, onDeleteMeetingType }){
   const monday = getMonday(new Date(Date.now() + weekOffset * 7 * 86400000));
   const parity = getParity(monday);
   const sunday = new Date(monday); sunday.setDate(sunday.getDate() + 6);
   const todayStr = new Date().toDateString();
   const [expandedDay, setExpandedDay] = useState(null);
+  const [manageTypesOpen, setManageTypesOpen] = useState(false);
+  const [newTypeName, setNewTypeName] = useState('');
 
   function meetingsForDay(dayIndex){
     return meetings
       .filter(m => m.weekday === dayIndex && (m.cadence === 'weekly' || m.parity === parity))
       .sort((a, b) => a.time.localeCompare(b.time));
   }
+
+  // Whether a meeting (by id) has any not-done prep task tied to it — surfaced as a
+  // small flag on its calendar block so a pending prep task isn't only visible from
+  // the Overview's 3-day-lookahead "Meeting Prep" strip.
+  function hasPendingPrep(meetingId){
+    return (tasks || []).some(t => t.meetingId === meetingId && t.status !== 'done');
+  }
+
+  function submitNewType(){
+    if (!newTypeName.trim()) return;
+    onAddMeetingType(newTypeName.trim());
+    setNewTypeName('');
+  }
+
+  const typeUsageCount = id =>
+    meetings.filter(m => m.type === id).length + plannedMeetings.filter(m => m.type === id).length;
 
   return (
     <section className="panel">
@@ -1147,11 +1385,43 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvent
           <span className="week-range">{monday.getDate()} {MONTHS[monday.getMonth()]} &ndash; {sunday.getDate()} {MONTHS[sunday.getMonth()]}</span>
           <button className="btn" onClick={() => setWeekOffset(w => w + 1)}>Next &rarr;</button>
           <button className="btn" onClick={() => setWeekOffset(0)}>Today</button>
+          <button className="btn" onClick={() => setManageTypesOpen(o => !o)}>Manage meeting types</button>
           <button className="btn btn--amber" onClick={() => setAddOpen(o => !o)}>+ Schedule sync</button>
         </div>
       </div>
 
-      <AddMeetingForm open={addOpen} onCancel={() => setAddOpen(false)} onSubmit={m => { onAddMeeting(m); setAddOpen(false); }} />
+      <div className={`add-form${manageTypesOpen ? ' open' : ''}`} style={{ gridTemplateColumns: '1fr auto' }}>
+        <div className="full" style={{ display: 'block', marginBottom: 4 }}>
+          <label>New meeting type</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input type="text" placeholder="e.g. Client Check-in" value={newTypeName}
+              onChange={e => setNewTypeName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') submitNewType(); }} />
+            <button className="btn btn--amber" onClick={submitNewType}>Create</button>
+          </div>
+        </div>
+        <div className="full" style={{ display: 'block' }}>
+          <div className="category-manage-list">
+            {meetingTypes.map(mt => {
+              const count = typeUsageCount(mt.id);
+              return (
+                <div key={mt.id} className="category-chip" style={{ '--cchip-color': mt.color }}>
+                  <span className="category-chip__title">{mt.label}</span>
+                  <span className="category-chip__count">{count}</span>
+                  <button
+                    className="icon-btn"
+                    title={count > 0 ? 'Still used by a meeting — reassign it first' : 'Delete type'}
+                    disabled={count > 0}
+                    onClick={() => onDeleteMeetingType(mt.id)}
+                  >&times;</button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <AddMeetingForm open={addOpen} onCancel={() => setAddOpen(false)} onSubmit={m => { onAddMeeting(m); setAddOpen(false); }} meetingTypes={meetingTypes} />
 
       <p style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-faint)', margin: '10px 0 0' }}>Click a day's date to view or edit its working hours &amp; Out of Office blocks.</p>
 
@@ -1190,7 +1460,7 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvent
                 ) : (
                   <React.Fragment>
                     {dayMeetings.map(m => {
-                      const t = MEETING_TYPES[m.type];
+                      const t = meetingTypeById(meetingTypes, m.type);
                       const status = getMeetingStatus(iso, m.time, m.duration);
                       return (
                         <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': t.color }}>
@@ -1206,17 +1476,20 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvent
                     })}
                     {dayPlanned.map(m => {
                       const isFocus = m.kind === 'focus';
-                      const color = isFocus ? 'var(--green)' : 'var(--purple)';
-                      const dim = isFocus ? 'var(--green-dim)' : 'var(--purple-dim)';
+                      const t = isFocus ? null : meetingTypeById(meetingTypes, m.type);
+                      const color = isFocus ? 'var(--green)' : t.color;
+                      const dim = isFocus ? 'var(--green-dim)' : t.dim;
+                      const pending = !isFocus && hasPendingPrep(m.id);
                       const status = getMeetingStatus(iso, m.time || '00:00', m.duration);
                       return (
-                        <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': color, cursor: isFocus ? 'default' : 'pointer' }}
-                          onClick={() => { if (!isFocus) onOpenMeeting(m.id); }}>
+                        <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': color, cursor: 'pointer' }}
+                          onClick={() => onOpenMeeting(m.id)}>
                           <button className="meeting-block__del" title="Remove" onClick={e => { e.stopPropagation(); onDeletePlanned(m.id); }}>&times;</button>
+                          {pending && <span className="meeting-block__flag" title="Has a pending prep task">&#9873;</span>}
                           <div className="meeting-block__time">{m.time || '—'} &middot; {formatDuration(m.duration || 30)}</div>
                           <div className="meeting-block__name">{m.title}</div>
                           <div className="meeting-block__foot">
-                            {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : 'Meeting'}</span>}
+                            {meetingStatusPill(status) || <span className="pill" style={{ '--pill-color': color, '--pill-bg': dim }}>{isFocus ? 'Focus time' : t.label}</span>}
                             {!isFocus && (m.agenda || []).length > 0 && (
                               <span className="pill" style={{ '--pill-color': 'var(--text-lo)', '--pill-bg': 'var(--ink-700)' }}>{m.agenda.length} agenda</span>
                             )}
@@ -1225,10 +1498,12 @@ function ScheduleBoard({ meetings, pendingMeetings, plannedMeetings, googleEvent
                       );
                     })}
                     {dayGoogle.map(m => {
+                      const pending = hasPendingPrep(m.id);
                       const status = getMeetingStatus(iso, m.time, m.duration);
                       return (
                         <div key={m.id} className={`meeting-block${status.status === 'done' ? ' is-complete' : ''}`} style={{ '--type-color': 'var(--cyan)', cursor: 'pointer' }}
                           onClick={() => onOpenMeeting(m.id)}>
+                          {pending && <span className="meeting-block__flag" title="Has a pending prep task">&#9873;</span>}
                           <div className="meeting-block__time">{m.time} &middot; {formatDuration(m.duration || 30)}</div>
                           <div className="meeting-block__name">{m.title}</div>
                           <div className="meeting-block__foot">
@@ -1462,11 +1737,11 @@ function AgendaList({ agenda, onChange }){
   );
 }
 
-function PlannedMeetingRow({ meeting, onOpen, onDelete }){
+function PlannedMeetingRow({ meeting, onOpen, onDelete, meetingTypes }){
   const agendaCount = (meeting.agenda || []).length;
   const doneCount = (meeting.agenda || []).filter(a => a.done).length;
-  const typeMeta = MEETING_TYPES[meeting.type];
-  const color = meeting.type && typeMeta ? typeMeta.color : 'var(--purple)';
+  const typeMeta = meetingTypeById(meetingTypes, meeting.type);
+  const color = typeMeta.color;
   return (
     <div className="planned-meeting-row" style={{ '--type-color': color }} onClick={onOpen}>
       <div className="planned-meeting-row__time">
@@ -1485,7 +1760,7 @@ function PlannedMeetingRow({ meeting, onOpen, onDelete }){
   );
 }
 
-function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
+function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete, meetingTypes }){
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState('');
   const [date, setDate] = useState('');
@@ -1521,10 +1796,7 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
           <label>Type</label>
           <select value={type} onChange={e => setType(e.target.value)}>
             <option value="other">General</option>
-            <option value="pod">POD Connect</option>
-            <option value="mentor">Mentor Sync</option>
-            <option value="champion">Champion Review</option>
-            <option value="sprint">Sprint Call</option>
+            {meetingTypes.map(mt => <option key={mt.id} value={mt.id}>{mt.label}</option>)}
           </select>
         </div>
         <div>
@@ -1556,7 +1828,8 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
           {sorted.map(m => (
             <PlannedMeetingRow key={m.id} meeting={m}
               onOpen={() => onOpen(m.id)}
-              onDelete={() => onDelete(m.id)} />
+              onDelete={() => onDelete(m.id)}
+              meetingTypes={meetingTypes} />
           ))}
         </div>
       )}
@@ -1568,11 +1841,13 @@ function PlannedMeetingsPanel({ items, onAdd, onOpen, onDelete }){
 function PrepTaskList({ meeting, prepTasks, categories, onAdd, onToggle, onDelete, onOpenTask }){
   const [title, setTitle] = useState('');
   const [categoryId, setCategoryId] = useState(categories[0] ? categories[0].id : '');
+  const [duration, setDuration] = useState(30);
+  const [deadline, setDeadline] = useState(meeting.date || '');
 
   function submit(){
     if (!title.trim() || !categoryId) return;
-    onAdd(categoryId, title.trim());
-    setTitle('');
+    onAdd(categoryId, title.trim(), duration, deadline);
+    setTitle(''); setDuration(30); setDeadline(meeting.date || '');
   }
 
   return (
@@ -1583,6 +1858,8 @@ function PrepTaskList({ meeting, prepTasks, categories, onAdd, onToggle, onDelet
             <div key={t.id} className={`subtask-item${t.status === 'done' ? ' done' : ''}`}>
               <input type="checkbox" checked={t.status === 'done'} onChange={() => onToggle(t.id)} />
               <span className="subtask-item__title" style={{ cursor: 'pointer' }} onClick={() => onOpenTask(t.id)}>{t.title}</span>
+              {t.endDate ? <span style={{ color: 'var(--text-faint)', fontSize: 10, fontFamily: 'var(--font-mono)' }}>due {t.endDate}</span> : null}
+              {t.estimatedDuration ? <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>{formatDuration(t.estimatedDuration)}</span> : null}
               <button className="icon-btn" title="Remove" onClick={() => onDelete(t.id)}>&times;</button>
             </div>
           ))}
@@ -1595,13 +1872,17 @@ function PrepTaskList({ meeting, prepTasks, categories, onAdd, onToggle, onDelet
         <select value={categoryId} onChange={e => setCategoryId(e.target.value)}>
           {categories.map(c => <option key={c.id} value={c.id}>{c.title}</option>)}
         </select>
+        <input type="date" value={deadline} max={meeting.date || undefined}
+          title="Deadline (can't be after the meeting itself)"
+          onChange={e => setDeadline(e.target.value)} />
+        <DurationSelect value={duration} onChange={setDuration} />
         <button className="btn btn--amber" onClick={submit}>Add</button>
       </div>
     </div>
   );
 }
 
-function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onDelete, onAddPrepTask, onTogglePrepTask, onDeletePrepTask, onOpenTask }){
+function MeetingDetailModal({ meeting, tasks, categories, meetingTypes, onClose, onUpdate, onDelete, onAddPrepTask, onTogglePrepTask, onDeletePrepTask, onOpenTask }){
   useEffect(() => {
     function onKey(e){ if (e.key === 'Escape') onClose(); }
     document.addEventListener('keydown', onKey);
@@ -1642,7 +1923,7 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
       <div className="modal-panel" onClick={e => e.stopPropagation()}>
         <div className="modal-panel__head">
           <div style={{ flex: 1 }}>
-            <p className="panel__eyebrow">{isGoogle ? 'Synced from Google Calendar' : (MEETING_TYPES[meeting.type] ? MEETING_TYPES[meeting.type].label : 'Meeting')}</p>
+            <p className="panel__eyebrow">{isGoogle ? 'Synced from Google Calendar' : meetingTypeById(meetingTypes, meeting.type).label}</p>
             {isGoogle ? (
               <div style={{ fontFamily: 'var(--font-display)', fontSize: 18, fontWeight: 700, marginTop: 2 }}>{meeting.title}</div>
             ) : (
@@ -1675,10 +1956,7 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
               <label>Type</label>
               <select value={meeting.type || 'other'} onChange={e => onUpdate({ type: e.target.value })}>
                 <option value="other">General</option>
-                <option value="pod">POD Connect</option>
-                <option value="mentor">Mentor Sync</option>
-                <option value="champion">Champion Review</option>
-                <option value="sprint">Sprint Call</option>
+                {meetingTypes.map(mt => <option key={mt.id} value={mt.id}>{mt.label}</option>)}
               </select>
             </div>
           </div>
@@ -1723,7 +2001,7 @@ function MeetingDetailModal({ meeting, tasks, categories, onClose, onUpdate, onD
             meeting={meeting}
             prepTasks={tasks.filter(t => t.meetingId === meeting.id)}
             categories={categories}
-            onAdd={(categoryId, title) => onAddPrepTask(meeting.id, categoryId, title, meeting.date)}
+            onAdd={(categoryId, title, duration, deadline) => onAddPrepTask(meeting.id, categoryId, title, meeting.date, duration, deadline)}
             onToggle={onTogglePrepTask}
             onDelete={onDeletePrepTask}
             onOpenTask={onOpenTask}
@@ -1974,13 +2252,14 @@ function QuickAddPanel({ categories, tasks, onAddTask, onAddCategory, onDeleteCa
   );
 }
 
-function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onReviseDue }){
+function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onReviseDue, onToggleSubtask }){
   const today = todayISO();
   const dueStatus = dueStatusInfo(task, today);
   const dueClass = dueStatus ? ` ${dueStatus.cssClass}` : '';
   const dueTitle = dueStatus ? dueStatus.label : 'End date';
   const hasContent = (task.notes && task.notes.trim()) || (task.closingRemark && task.closingRemark.trim()) || task.link;
   const hasHistory = task.dueRevisions && task.dueRevisions.length > 0;
+  const [expanded, setExpanded] = useState(false);
 
   function handleStatusChange(e){
     const value = e.target.value;
@@ -1995,35 +2274,59 @@ function TaskRow({ task, onUpdate, onSetStatus, onToggleRisk, onOpenDetail, onRe
     if (isRevision) onOpenDetail(); // surface the (optional) revision remark right away
   }
 
+  const subtasks = task.subtasks || [];
+  const hasSubtasks = subtasks.length > 0;
+  const doneCount = subtasks.filter(s => s.done).length;
+
   return (
-    <div className="task-row">
-      <select
-        className={`status-select status-${task.status}${task.atRisk ? ' at-risk' : ''}`}
-        value={task.status}
-        title="Update status"
-        onChange={handleStatusChange}
-      >
-        <option value="todo">To do</option>
-        <option value="progress">In progress</option>
-        <option value="done">Done</option>
-      </select>
-      <input className={`task-title${task.status === 'done' ? ' is-done' : ''}`} type="text" value={task.title}
-        onChange={e => onUpdate({ title: e.target.value })} />
-      <div className="date-range">
-        <input className="task-due" type="date" value={task.startDate || ''} title="Start date"
-          onChange={e => onUpdate({ startDate: e.target.value })} />
-        <span className="date-range__arrow">&rarr;</span>
-        <div className="due-wrap">
-          <input className={`task-due${dueClass}`} type="date" value={task.endDate || ''} title={dueTitle}
-            onChange={handleEndDateChange} />
-          {hasHistory && <span className="extended-dot" title={`Deadline extended ${task.dueRevisions.length}\u00d7`} />}
+    <div className="task-row-wrap">
+      <div className="task-row">
+        <select
+          className={`status-select status-${task.status}${task.atRisk ? ' at-risk' : ''}`}
+          value={task.status}
+          title="Update status"
+          onChange={handleStatusChange}
+        >
+          <option value="todo">To do</option>
+          <option value="progress">In progress</option>
+          <option value="done">Done</option>
+        </select>
+        <input className={`task-title${task.status === 'done' ? ' is-done' : ''}`} type="text" value={task.title}
+          onChange={e => onUpdate({ title: e.target.value })} />
+        <div className="date-range">
+          <input className="task-due" type="date" value={task.startDate || ''}
+            title={hasSubtasks ? 'Start date — computed from sub-tasks (earliest sub-task start)' : 'Start date'}
+            disabled={hasSubtasks}
+            onChange={e => onUpdate({ startDate: e.target.value })} />
+          <span className="date-range__arrow">&rarr;</span>
+          <div className="due-wrap">
+            <input className={`task-due${dueClass}`} type="date" value={task.endDate || ''}
+              title={hasSubtasks ? 'Due date — computed from sub-tasks (latest sub-task end)' : dueTitle}
+              disabled={hasSubtasks}
+              onChange={handleEndDateChange} />
+            {hasHistory && <span className="extended-dot" title={`Deadline extended ${task.dueRevisions.length}\u00d7`} />}
+          </div>
         </div>
+        <button className={`icon-btn${task.atRisk ? ' flag-on' : ''}`} title="Flag at risk" onClick={onToggleRisk}>&#9873;</button>
+        {hasSubtasks && (
+          <button className={`subtask-badge${expanded ? ' is-open' : ''}`} title="Show sub-tasks" onClick={() => setExpanded(x => !x)}>
+            {doneCount}/{subtasks.length} <span className="subtask-badge__caret">{expanded ? '\u25b4' : '\u25be'}</span>
+          </button>
+        )}
+        <button className={`icon-btn${hasContent ? ' link-on' : ''}`} title="Open details & notes" onClick={onOpenDetail}>&#8942;</button>
       </div>
-      <button className={`icon-btn${task.atRisk ? ' flag-on' : ''}`} title="Flag at risk" onClick={onToggleRisk}>&#9873;</button>
-      {task.subtasks && task.subtasks.length > 0 && (
-        <span className="subtask-badge" title="Sub-task progress">{task.subtasks.filter(s => s.done).length}/{task.subtasks.length}</span>
+      {hasSubtasks && expanded && (
+        <div className="subtask-quickview">
+          {subtasks.map(s => (
+            <div key={s.id} className={`subtask-quickview__item${s.done ? ' done' : ''}`}>
+              <input type="checkbox" checked={s.done} onChange={() => onToggleSubtask(s.id)} />
+              <span className="subtask-quickview__title" onClick={onOpenDetail}>{s.title}</span>
+              {s.endDate && <span className="subtask-quickview__date">{s.endDate}</span>}
+              {s.estimatedDuration ? <span className="subtask-quickview__duration">{formatDuration(s.estimatedDuration)}</span> : null}
+            </div>
+          ))}
+        </div>
       )}
-      <button className={`icon-btn${hasContent ? ' link-on' : ''}`} title="Open details & notes" onClick={onOpenDetail}>&#8942;</button>
     </div>
   );
 }
@@ -2032,19 +2335,22 @@ function SubtaskList({ task, onAdd, onToggle, onUpdate, onDelete }){
   const [title, setTitle] = useState('');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
+  const [duration, setDuration] = useState(30);
   const subtasks = task.subtasks || [];
   const doneCount = subtasks.filter(s => s.done).length;
 
   function submit(){
     if (!title.trim()) return;
-    onAdd(title.trim(), startDate, endDate);
-    setTitle(''); setStartDate(''); setEndDate('');
+    onAdd(title.trim(), startDate, endDate, duration);
+    setTitle(''); setStartDate(''); setEndDate(''); setDuration(30);
   }
 
   return (
     <div>
       {subtasks.length > 0 && (
-        <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 8 }}>{doneCount}/{subtasks.length} complete</p>
+        <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 8 }}>
+          {doneCount}/{subtasks.length} complete &middot; the task's own start/end above are computed from these
+        </p>
       )}
       {subtasks.length > 0 && (
         <div className="subtask-list">
@@ -2052,11 +2358,12 @@ function SubtaskList({ task, onAdd, onToggle, onUpdate, onDelete }){
             <div key={s.id} className={`subtask-item${s.done ? ' done' : ''}`}>
               <input type="checkbox" checked={s.done} onChange={() => onToggle(s.id)} />
               <span className="subtask-item__title">{s.title}</span>
-              <input type="date" className="subtask-item__date" value={s.startDate || ''} title="Start date (can't be before the task's own start)"
+              <input type="date" className="subtask-item__date" value={s.startDate || ''} title="Start date"
                 onChange={e => onUpdate(s.id, { startDate: e.target.value })} />
               <span style={{ color: 'var(--text-faint)', fontSize: 10 }}>&rarr;</span>
-              <input type="date" className="subtask-item__date" value={s.endDate || ''} title="End date (can't be after the task's own end)"
+              <input type="date" className="subtask-item__date" value={s.endDate || ''} title="End date"
                 onChange={e => onUpdate(s.id, { endDate: e.target.value })} />
+              <DurationSelect value={s.estimatedDuration || 0} onChange={val => onUpdate(s.id, { estimatedDuration: val })} />
               <button className="icon-btn" title="Remove" onClick={() => onDelete(s.id)}>&times;</button>
             </div>
           ))}
@@ -2068,6 +2375,7 @@ function SubtaskList({ task, onAdd, onToggle, onUpdate, onDelete }){
           onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
         <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)} title="Start date (optional)" />
         <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)} title="End date (optional)" />
+        <DurationSelect value={duration} onChange={setDuration} />
         <button className="btn" onClick={submit}>Add</button>
       </div>
     </div>
@@ -2084,6 +2392,7 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
   if (!task) return null;
 
   const revisions = task.dueRevisions || [];
+  const hasSubtasks = task.subtasks && task.subtasks.length > 0;
 
   function handleEndDateChange(e){
     const newVal = e.target.value;
@@ -2125,12 +2434,16 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
             </select>
           </div>
           <div>
-            <label>Start date</label>
-            <input type="date" value={task.startDate || ''} onChange={e => onUpdate({ startDate: e.target.value })} />
+            <label>Start date{hasSubtasks ? <span style={{ color: 'var(--text-faint)', fontWeight: 400 }}> (from sub-tasks)</span> : null}</label>
+            <input type="date" value={task.startDate || ''} disabled={hasSubtasks}
+              title={hasSubtasks ? 'Computed from sub-tasks — earliest sub-task start' : undefined}
+              onChange={e => onUpdate({ startDate: e.target.value })} />
           </div>
           <div>
-            <label>End date {revisions.length > 0 && <span style={{ color: 'var(--purple)' }}>(Extended)</span>}</label>
-            <input type="date" value={task.endDate || ''} onChange={handleEndDateChange} />
+            <label>End date{hasSubtasks ? <span style={{ color: 'var(--text-faint)', fontWeight: 400 }}> (from sub-tasks)</span> : (revisions.length > 0 && <span style={{ color: 'var(--purple)' }}> (Extended)</span>)}</label>
+            <input type="date" value={task.endDate || ''} disabled={hasSubtasks}
+              title={hasSubtasks ? 'Computed from sub-tasks — latest sub-task end' : undefined}
+              onChange={handleEndDateChange} />
           </div>
           <div>
             <label>Risk flag</label>
@@ -2196,7 +2509,7 @@ function TaskDetailModal({ task, category, onClose, onUpdate, onDelete, onRevise
           <label>Sub-tasks</label>
           <SubtaskList
             task={task}
-            onAdd={(title, s, e) => onAddSubtask(title, s, e)}
+            onAdd={(title, s, e, dur) => onAddSubtask(title, s, e, dur)}
             onToggle={id => onToggleSubtask(id)}
             onUpdate={(id, patch) => onUpdateSubtask(id, patch)}
             onDelete={id => onDeleteSubtask(id)}
@@ -2230,7 +2543,7 @@ function categoryStatus(tasks, categoryId){
   return { label: 'IDLE', color: 'var(--text-faint)' };
 }
 
-function TaskListView({ tasks, categories, onUpdateTask, onSetTaskStatus, onToggleRisk, onOpenDetail, onReviseDue }){
+function TaskListView({ tasks, categories, onUpdateTask, onSetTaskStatus, onToggleRisk, onOpenDetail, onReviseDue, onToggleSubtask }){
   const [filter, setFilter] = useState('all');
 
   const today = todayISO();
@@ -2254,6 +2567,7 @@ function TaskListView({ tasks, categories, onUpdateTask, onSetTaskStatus, onTogg
         onToggleRisk={() => onToggleRisk(t.id)}
         onOpenDetail={() => onOpenDetail(t.id)}
         onReviseDue={date => onReviseDue(t.id, date)}
+        onToggleSubtask={subId => onToggleSubtask(t.id, subId)}
       />
     );
   }
@@ -2429,7 +2743,7 @@ function DayPlanModal({ preview, categories, variant, onApply, onClose, onGoToTa
   function delayItem(i){
     const item = items[i];
     setItems(its => its.filter((_, idx) => idx !== i));
-    if (item) onDelay(item.taskId);
+    if (item) onDelay(item.taskId, item.subtaskId);
   }
 
   const headings = {
@@ -2486,7 +2800,7 @@ function DayPlanModal({ preview, categories, variant, onApply, onClose, onGoToTa
                 <label style={{ color: 'var(--red)' }}>Couldn't fully fit ({unfit.length})</label>
                 <div className="today-list">
                   {unfit.map(u => (
-                    <div key={u.taskId} className="today-item" style={{ cursor: 'pointer' }} onClick={() => onGoToTask(u.taskId)}>
+                    <div key={`${u.taskId}-${u.subtaskId || 'task'}`} className="today-item" style={{ cursor: 'pointer' }} onClick={() => onGoToTask(u.taskId)}>
                       <span className="today-item__title">
                         {u.taskTitle}
                         {u.tier && <span className="chat-bubble__tool-chip" style={{ marginLeft: 6 }}>{TIER_LABELS[u.tier] || u.tier}</span>}
@@ -2941,6 +3255,7 @@ function App(){
   const [loaded, setLoaded] = useState(false);
   const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
   const [categoryCounter, setCategoryCounter] = useState(DEFAULT_CATEGORIES.length + 1);
+  const [meetingTypes, setMeetingTypes] = useState(DEFAULT_MEETING_TYPES);
   const [meetings, setMeetings] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [quickLinks, setQuickLinks] = useState([]);
@@ -2979,6 +3294,7 @@ function App(){
   const [digestOpen, setDigestOpen] = useState(false);
   const [oooRanges, setOooRanges] = useState({});
   const [stickyNotes, setStickyNotes] = useState([]);
+  const [filingNoteId, setFilingNoteId] = useState(null);
   const [lastEodPromptDate, setLastEodPromptDate] = useState('');
   const [eodModalOpen, setEodModalOpen] = useState(false);
   const [legacyImport, setLegacyImport] = useState(null);
@@ -3004,6 +3320,7 @@ function App(){
     const cats = (parsed.categories && parsed.categories.length) ? parsed.categories : DEFAULT_CATEGORIES;
     setCategories(cats);
     setCategoryCounter(parsed.categoryCounter || (cats.length + 1));
+    setMeetingTypes((parsed.meetingTypes && parsed.meetingTypes.length) ? parsed.meetingTypes : DEFAULT_MEETING_TYPES);
     setMeetings(parsed.meetings || []);
     setTasks(parsed.tasks || []);
     setQuickLinks(parsed.quickLinks || []);
@@ -3143,7 +3460,7 @@ function App(){
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       const payload = {
-        categories, categoryCounter, meetings, tasks, quickLinks, linkTags,
+        categories, categoryCounter, meetingTypes, meetings, tasks, quickLinks, linkTags,
         pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours,
         lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate
       };
@@ -3157,7 +3474,7 @@ function App(){
         });
     }, 800);
     return () => clearTimeout(saveTimer.current);
-  }, [categories, categoryCounter, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate, loaded, session]);
+  }, [categories, categoryCounter, meetingTypes, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate, loaded, session]);
 
   function signOut(){
     supabaseClient.auth.signOut();
@@ -3268,13 +3585,26 @@ function App(){
     if (hasTasks) return; // guarded in the UI too; extra safety here
     setCategories(cs => cs.filter(c => c.id !== id));
   }
+  function addMeetingType(label){
+    const palette = colorForIndex(meetingTypes.length);
+    setMeetingTypes(mts => [...mts, { id: uid(), label, color: palette.chip, dim: palette.chipDim }]);
+  }
+  function deleteMeetingType(id){
+    const inUse = meetings.some(m => m.type === id) || plannedMeetings.some(m => m.type === id);
+    if (inUse) return; // guarded in the UI too; extra safety here
+    setMeetingTypes(mts => mts.filter(t => t.id !== id));
+  }
 
   /* ---------- Task actions ---------- */
   function addTask(categoryId, title, startDate, endDate){
     setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: startDate || '', endDate: endDate || '', notes: '', link: '', closingRemark: '', weight: 1, completedAt: '' }]);
   }
-  function addPrepTask(meetingId, categoryId, title, meetingDate){
-    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: '', endDate: meetingDate || '', notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', meetingId }]);
+  function addPrepTask(meetingId, categoryId, title, meetingDate, duration, deadline){
+    // Defensively cap here too (not just in the UI's max attribute) — a prep
+    // task's deadline can be earlier than its meeting but never later.
+    let due = deadline || meetingDate || '';
+    if (meetingDate && due > meetingDate) due = meetingDate;
+    setTasks(ts => [...ts, { id: uid(), theme: categoryId, title, status: 'todo', atRisk: false, startDate: '', endDate: due, notes: '', link: '', closingRemark: '', weight: 1, completedAt: '', meetingId, estimatedDuration: duration || null }]);
   }
   function togglePrepTask(taskId){
     setTasks(ts => ts.map(t => {
@@ -3324,7 +3654,7 @@ function App(){
     const ctx = buildDayPlanCtx();
     const preview = computeDayPlan(dateISO, ctx);
     setDayPlanPreview({ dateISO, variant: variant || 'manual', ...preview });
-    setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx) });
+    setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx), planFingerprint: fingerprintDayPlan(preview) });
   }
   // Shared by "Apply to calendar" / "Update plan" and the assistant's apply_day_plan tool.
   // Regenerating for the same day only ever replaces this planner's own past output —
@@ -3334,7 +3664,7 @@ function App(){
       const kept = pm.filter(m => !(m.kind === 'focus' && m.source === 'auto-plan' && m.date === dateISO));
       const added = placements.map(p => ({
         id: uid(), title: `Focus: ${p.taskTitle}`, date: p.date, time: p.time, duration: p.duration,
-        agenda: [], notes: '', kind: 'focus', taskId: p.taskId, source: 'auto-plan', planDate: dateISO
+        agenda: [], notes: '', kind: 'focus', taskId: p.taskId, subtaskId: p.subtaskId || null, source: 'auto-plan', planDate: dateISO
       }));
       return [...kept, ...added];
     });
@@ -3348,19 +3678,30 @@ function App(){
     setDayPlanPreview(null);
     goToTask(id);
   }
-  // "Delay" on a plan row means consciously pushing that task's own deadline to
+  // "Delay" on a plan row means consciously pushing that item's own deadline to
   // tomorrow (using the same revision-history mechanism as editing its due date
-  // anywhere else), not just hiding it from today's view.
-  function delayDayPlanTask(taskId){
+  // anywhere else), not just hiding it from today's view. For a sub-task-level
+  // placement, that means the sub-task's own end date (which rolls up to the
+  // parent task automatically) rather than the parent task's date directly.
+  function delayDayPlanTask(taskId, subtaskId){
     const d = new Date();
     d.setDate(d.getDate() + 1);
-    reviseDueDate(taskId, isoOf(d));
+    const tomorrow = isoOf(d);
+    if (subtaskId) {
+      updateSubtask(taskId, subtaskId, { endDate: tomorrow });
+    } else {
+      reviseDueDate(taskId, tomorrow);
+    }
   }
 
   // Re-checks whether today's plan is still current whenever plan-relevant state
   // changes (a task's dates/estimate/status, a meeting added/moved, working hours,
-  // OOO). Debounced, and only once a baseline plan exists for today and no plan
-  // modal is already open, so it never interrupts active editing.
+  // OOO). Waits for a 5-minute quiet period after the last relevant change before
+  // recomputing — long enough that a burst of edits doesn't pop the modal mid-edit —
+  // and only once a baseline plan exists for today and no plan modal is already open.
+  // Even then, it only surfaces "Your day changed" if the recomputed plan's actual
+  // placements differ from what's currently applied; an input change that happens to
+  // recompute to the same plan is a no-op and stays silent.
   useEffect(() => {
     if (!loaded || !dayPlanBaseline || dayPlanPreview) return;
     const dateISO = todayISO();
@@ -3370,9 +3711,16 @@ function App(){
       const currentSig = getDayPlanSignatureInputs(dateISO, ctx);
       if (currentSig === dayPlanBaseline.signature) return;
       const preview = computeDayPlan(dateISO, ctx);
+      const newFingerprint = fingerprintDayPlan(preview);
+      if (newFingerprint === dayPlanBaseline.planFingerprint) {
+        // Inputs changed but the resulting plan didn't — update the baseline
+        // silently so we're comparing against fresh inputs next time, no popup.
+        setDayPlanBaseline({ dateISO, signature: currentSig, planFingerprint: newFingerprint });
+        return;
+      }
       setDayPlanPreview({ dateISO, variant: 'update', ...preview });
-      setDayPlanBaseline({ dateISO, signature: currentSig });
-    }, 1500);
+      setDayPlanBaseline({ dateISO, signature: currentSig, planFingerprint: newFingerprint });
+    }, 5 * 60 * 1000);
     return () => clearTimeout(timer);
     // eslint-disable-next-line
   }, [tasks, meetings, plannedMeetings, googleEvents, workingHours, defaultWorkingHours, oooRanges, loaded, dayPlanBaseline, dayPlanPreview]);
@@ -3489,7 +3837,7 @@ function App(){
       case 'add_subtask': {
         const t = tasks.find(x => x.id === input.taskId);
         if (!t) return `Failed: no task with id ${input.taskId}`;
-        addSubtask(input.taskId, input.title, input.startDate || '', input.endDate || '');
+        addSubtask(input.taskId, input.title, input.startDate || '', input.endDate || '', input.estimatedDurationMinutes || null);
         return `Added sub-task "${input.title}" to "${t.title}".`;
       }
       case 'toggle_subtask': {
@@ -3503,7 +3851,7 @@ function App(){
         const ctx = buildDayPlanCtx();
         const preview = computeDayPlan(dateISO, ctx);
         setDayPlanPreview({ dateISO, variant: 'manual', ...preview });
-        setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx) });
+        setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx), planFingerprint: fingerprintDayPlan(preview) });
         return JSON.stringify({ dateISO, ...preview });
       }
       case 'apply_day_plan': {
@@ -3675,7 +4023,7 @@ function App(){
     if (todayHours) ctx.workingHours = { ...ctx.workingHours, [dateISO]: todayHours };
     const preview = computeDayPlan(dateISO, ctx);
     setDayPlanPreview({ dateISO, variant: 'morning', ...preview });
-    setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx) });
+    setDayPlanBaseline({ dateISO, signature: getDayPlanSignatureInputs(dateISO, ctx), planFingerprint: fingerprintDayPlan(preview) });
   }
   function closeDigest(){
     if (new Date().getDay() === 5) setLastDigestWeek(isoOf(getMonday(new Date())));
@@ -3711,6 +4059,29 @@ function App(){
   function deleteStickyNote(id){
     setStickyNotes(ns => ns.filter(n => n.id !== id));
   }
+  function fileNoteAsTask(noteId, categoryId){
+    const note = stickyNotes.find(n => n.id === noteId);
+    if (!note) return;
+    addTask(categoryId, note.text, '', '');
+    deleteStickyNote(noteId);
+    setFilingNoteId(null);
+  }
+  function fileNoteAsPrepTask(noteId, meetingId, categoryId){
+    const note = stickyNotes.find(n => n.id === noteId);
+    const meeting = plannedMeetings.find(m => m.id === meetingId);
+    if (!note || !meeting) return;
+    addPrepTask(meetingId, categoryId, note.text, meeting.date);
+    deleteStickyNote(noteId);
+    setFilingNoteId(null);
+  }
+  function fileNoteAsAgenda(noteId, meetingId){
+    const note = stickyNotes.find(n => n.id === noteId);
+    const meeting = plannedMeetings.find(m => m.id === meetingId);
+    if (!note || !meeting) return;
+    updatePlannedMeeting(meetingId, { agenda: [...(meeting.agenda || []), { id: uid(), text: note.text, done: false }] });
+    deleteStickyNote(noteId);
+    setFilingNoteId(null);
+  }
   function closeEodModal(){
     setLastEodPromptDate(todayISO());
     setEodModalOpen(false);
@@ -3744,11 +4115,16 @@ function App(){
   }
 
   /* ---------- Sub-tasks ---------- */
-  function addSubtask(taskId, title, startDate, endDate){
+  function addSubtask(taskId, title, startDate, endDate, estimatedDuration){
     setTasks(ts => ts.map(t => {
       if (t.id !== taskId) return t;
-      const clamped = clampSubtaskDates(t, startDate, endDate);
-      return { ...t, subtasks: [...(t.subtasks || []), { id: uid(), title, done: false, startDate: clamped.startDate, endDate: clamped.endDate }] };
+      const subtasks = [...(t.subtasks || []), {
+        id: uid(), title, done: false,
+        startDate: startDate || '', endDate: endDate || '',
+        estimatedDuration: estimatedDuration || 0
+      }];
+      const rolled = rollUpTaskDates(subtasks);
+      return { ...t, subtasks, ...(rolled || {}) };
     }));
   }
   function toggleSubtask(taskId, subId){
@@ -3757,19 +4133,18 @@ function App(){
   function updateSubtask(taskId, subId, patch){
     setTasks(ts => ts.map(t => {
       if (t.id !== taskId) return t;
-      return {
-        ...t,
-        subtasks: (t.subtasks || []).map(s => {
-          if (s.id !== subId) return s;
-          const merged = { ...s, ...patch };
-          const clamped = clampSubtaskDates(t, merged.startDate, merged.endDate);
-          return { ...merged, ...clamped };
-        })
-      };
+      const subtasks = (t.subtasks || []).map(s => (s.id === subId ? { ...s, ...patch } : s));
+      const rolled = rollUpTaskDates(subtasks);
+      return { ...t, subtasks, ...(rolled || {}) };
     }));
   }
   function deleteSubtask(taskId, subId){
-    setTasks(ts => ts.map(t => (t.id !== taskId ? t : { ...t, subtasks: (t.subtasks || []).filter(s => s.id !== subId) })));
+    setTasks(ts => ts.map(t => {
+      if (t.id !== taskId) return t;
+      const subtasks = (t.subtasks || []).filter(s => s.id !== subId);
+      const rolled = subtasks.length > 0 ? rollUpTaskDates(subtasks) : null;
+      return { ...t, subtasks, ...(rolled || {}) };
+    }));
   }
 
   /* ---------- Derived stats ---------- */
@@ -3778,9 +4153,9 @@ function App(){
   const realParity = getParity(realMonday);
   const todayIdx = (new Date().getDay() + 6) % 7;
   const meetingsToday = meetings.filter(m => m.weekday === todayIdx && (m.cadence === 'weekly' || m.parity === realParity)).length
-    + plannedMeetings.filter(m => m.date === today).length
+    + plannedMeetings.filter(m => m.date === today && m.kind !== 'focus').length
     + googleEvents.map(normalizeGoogleEvent).filter(m => m.date === today).length;
-  const tasksDueToday = tasks.filter(t => t.status !== 'done' && taskAppearsOn(t, today)).length;
+  const tasksDueToday = tasks.filter(t => t.status !== 'done' && taskIsDueTodayOrOverdue(t, today)).length;
   const atRiskCount = tasks.filter(t => t.status !== 'done' && (t.atRisk || (t.endDate && t.endDate < today && !(t.dueRevisions && t.dueRevisions.length)))).length;
   const doneCount = tasks.filter(t => t.status === 'done').length;
 
@@ -3874,7 +4249,7 @@ function App(){
 
           <ProgressPanel dailyProgress={dailyProgress} weeklyProgress={weeklyProgress} timeElapsedPercent={timeElapsedPercent} weekElapsedPercent={weekElapsedPercent} />
 
-          <StickyNotesPanel notes={stickyNotes} onAdd={addStickyNote} onDelete={deleteStickyNote} />
+          <StickyNotesPanel notes={stickyNotes} onAdd={addStickyNote} onDelete={deleteStickyNote} onFile={setFilingNoteId} />
 
           {upcomingDeadlines.length > 0 && (
             <section className="panel deadlines-panel">
@@ -3917,11 +4292,16 @@ function App(){
               todayIdx={todayIdx}
               realParity={realParity}
               onClickMeeting={() => setActiveTab('calendar')}
+              meetingTypes={meetingTypes}
             />
             <TodayTasksCard
               tasks={tasks}
               categories={categories}
               onClickTask={goToTask}
+            />
+            <TodayFocusCard
+              plannedMeetings={plannedMeetings}
+              onClickFocus={setMeetingDetailId}
             />
           </div>
 
@@ -3951,12 +4331,15 @@ function App(){
             onAdd={addPlannedMeeting}
             onOpen={setMeetingDetailId}
             onDelete={deletePlannedMeeting}
+            meetingTypes={meetingTypes}
           />
           <ScheduleBoard
             meetings={meetings}
             pendingMeetings={pendingMeetings}
             plannedMeetings={plannedMeetings}
             googleEvents={normalizedGoogleEvents}
+            tasks={tasks}
+            meetingTypes={meetingTypes}
             weekOffset={weekOffset}
             setWeekOffset={setWeekOffset}
             onDeleteMeeting={deleteMeeting}
@@ -3972,6 +4355,8 @@ function App(){
             onToggleFullDayOOO={toggleFullDayOOO}
             onAddOOOBlock={addOOOBlock}
             onDeleteOOOBlock={deleteOOOBlock}
+            onAddMeetingType={addMeetingType}
+            onDeleteMeetingType={deleteMeetingType}
           />
           <GoogleCalendarSyncPanel
             url={settings.googleCalendarUrl}
@@ -4002,6 +4387,7 @@ function App(){
             onToggleRisk={toggleRisk}
             onOpenDetail={setDetailTaskId}
             onReviseDue={reviseDueDate}
+            onToggleSubtask={toggleSubtask}
           />
         </React.Fragment>
       )}
@@ -4027,7 +4413,7 @@ function App(){
           onDelete={() => deleteTask(detailTaskId)}
           onReviseDue={date => reviseDueDate(detailTaskId, date)}
           onSetFocusTime={() => setFocusTaskId(detailTaskId)}
-          onAddSubtask={(title, s, e) => addSubtask(detailTaskId, title, s, e)}
+          onAddSubtask={(title, s, e, dur) => addSubtask(detailTaskId, title, s, e, dur)}
           onToggleSubtask={subId => toggleSubtask(detailTaskId, subId)}
           onUpdateSubtask={(subId, patch) => updateSubtask(detailTaskId, subId, patch)}
           onDeleteSubtask={subId => deleteSubtask(detailTaskId, subId)}
@@ -4046,20 +4432,35 @@ function App(){
         />
       )}
 
-      {meetingDetailId && (
-        <MeetingDetailModal
-          meeting={allMeetingsForLookup.find(m => m.id === meetingDetailId)}
-          tasks={tasks}
-          categories={categories}
-          onClose={() => setMeetingDetailId(null)}
-          onUpdate={patch => { if (!meetingDetailId.startsWith('google-')) updatePlannedMeeting(meetingDetailId, patch); }}
-          onDelete={() => { if (!meetingDetailId.startsWith('google-')) deletePlannedMeeting(meetingDetailId); }}
-          onAddPrepTask={addPrepTask}
-          onTogglePrepTask={togglePrepTask}
-          onDeletePrepTask={deleteTask}
-          onOpenTask={taskId => { setMeetingDetailId(null); setDetailTaskId(taskId); }}
-        />
-      )}
+      {meetingDetailId && (() => {
+        const selected = allMeetingsForLookup.find(m => m.id === meetingDetailId);
+        if (selected && selected.kind === 'focus') {
+          return (
+            <FocusTimeModal
+              task={tasks.find(t => t.id === selected.taskId) || { title: (selected.title || '').replace(/^Focus: /, '') }}
+              initial={{ date: selected.date, time: selected.time, duration: selected.duration }}
+              onClose={() => setMeetingDetailId(null)}
+              onSave={(date, time, duration) => { updatePlannedMeeting(meetingDetailId, { date, time, duration }); setMeetingDetailId(null); }}
+              onDelete={() => { deletePlannedMeeting(meetingDetailId); setMeetingDetailId(null); }}
+            />
+          );
+        }
+        return (
+          <MeetingDetailModal
+            meeting={selected}
+            tasks={tasks}
+            categories={categories}
+            meetingTypes={meetingTypes}
+            onClose={() => setMeetingDetailId(null)}
+            onUpdate={patch => { if (!meetingDetailId.startsWith('google-')) updatePlannedMeeting(meetingDetailId, patch); }}
+            onDelete={() => { if (!meetingDetailId.startsWith('google-')) deletePlannedMeeting(meetingDetailId); }}
+            onAddPrepTask={addPrepTask}
+            onTogglePrepTask={togglePrepTask}
+            onDeletePrepTask={deleteTask}
+            onOpenTask={taskId => { setMeetingDetailId(null); setDetailTaskId(taskId); }}
+          />
+        );
+      })()}
 
       {dailyPlannerOpen && !legacyImport && (
         <DailyPlannerModal
@@ -4100,7 +4501,19 @@ function App(){
       )}
 
       {eodModalOpen && (
-        <EndOfDayModal notes={stickyNotes} onClose={closeEodModal} />
+        <EndOfDayModal notes={stickyNotes} onClose={closeEodModal} onFile={setFilingNoteId} />
+      )}
+
+      {filingNoteId && (
+        <FileNoteModal
+          note={stickyNotes.find(n => n.id === filingNoteId)}
+          meetings={plannedMeetings.filter(m => m.kind === 'meeting').sort((a, b) => (a.date || '').localeCompare(b.date || ''))}
+          categories={categories}
+          onClose={() => setFilingNoteId(null)}
+          onFileTask={categoryId => fileNoteAsTask(filingNoteId, categoryId)}
+          onFilePrepTask={(meetingId, categoryId) => fileNoteAsPrepTask(filingNoteId, meetingId, categoryId)}
+          onFileAgenda={meetingId => fileNoteAsAgenda(filingNoteId, meetingId)}
+        />
       )}
 
       {legacyImport && (
