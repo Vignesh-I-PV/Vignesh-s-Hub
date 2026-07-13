@@ -99,6 +99,10 @@ body{
 .btn--amber:hover{background:var(--amber); color:var(--ink-950);}
 .btn--danger{background:var(--red-dim); border-color:var(--red); color:var(--red);}
 .btn--danger:hover{background:var(--red); color:var(--ink-950);}
+.segmented{display:flex; flex-wrap:wrap; gap:6px;}
+.segmented__opt{font-family:var(--font-body); font-size:11px; font-weight:600; color:var(--text-lo); background:var(--ink-800); border:1px solid var(--line); border-radius:7px; padding:6px 10px; cursor:pointer; transition:border-color .15s, background-color .15s, color .15s;}
+.segmented__opt:hover{border-color:var(--amber);}
+.segmented__opt.is-active{background:var(--amber-dim); border-color:var(--amber); color:var(--amber);}
 
 /* ---------- Schedule board ---------- */
 .schedule-grid{display:grid; grid-template-columns:repeat(7,minmax(140px,1fr)); gap:10px; overflow-x:auto;}
@@ -115,6 +119,7 @@ body{
 .pill{font-family:var(--font-mono); font-size:9px; letter-spacing:.05em; text-transform:uppercase; padding:2px 6px; border-radius:20px; color:var(--pill-color,var(--cyan)); background:var(--pill-bg,var(--cyan-dim));}
 .meeting-block__del{position:absolute; top:4px; right:4px; background:none; border:none; color:var(--text-faint); cursor:pointer; font-size:13px; line-height:1; padding:2px;}
 .meeting-block__del:hover{color:var(--red);}
+.meeting-block__flag{position:absolute; top:5px; right:22px; color:var(--amber); font-size:12px; line-height:1;}
 .placeholder-block{background:transparent; border:1px dashed var(--amber); border-radius:6px; padding:6px 8px;}
 .placeholder-block__name{font-family:var(--font-body); font-size:12px; color:var(--text-lo); margin-bottom:4px;}
 .meeting-block.is-complete{opacity:.55;}
@@ -199,7 +204,7 @@ body{
 .theme-card__count{font-family:var(--font-mono); font-size:11px; color:var(--text-lo); background:var(--ink-800); border-radius:20px; padding:3px 9px; height:fit-content;}
 
 .task-list{display:flex; flex-direction:column; gap:8px; margin-bottom:10px; max-height:340px; overflow-y:auto; padding-right:2px;}
-.task-row{display:grid; grid-template-columns:auto 1fr auto auto auto; align-items:center; gap:6px; background:var(--ink-800); border:1px solid var(--line); border-radius:7px; padding:7px 8px;}
+.task-row{display:grid; grid-template-columns:auto 1fr auto auto auto auto; align-items:center; gap:6px; background:var(--ink-800); border:1px solid var(--line); border-radius:7px; padding:7px 8px;}
 .status-select{background:var(--ink-900); border:1px solid var(--line); border-radius:5px; font-family:var(--font-mono); font-size:10px; padding:4px 3px; width:96px; cursor:pointer;}
 .status-select.status-todo{color:var(--text-lo); border-color:var(--line);}
 .status-select.status-progress{color:var(--cyan); border-color:var(--cyan);}
@@ -304,116 +309,24 @@ body{
 
 /* ---------- Sub-tasks ---------- */
 .subtask-list{display:flex; flex-direction:column; gap:6px; margin-bottom:8px;}
-.subtask-item{display:flex; align-items:center; gap:8px; background:var(--ink-800); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font-size:12px;}
+.subtask-item{display:flex; flex-wrap:wrap; align-items:center; gap:6px 8px; background:var(--ink-800); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font-size:12px;}
 .subtask-item input[type=checkbox]{accent-color:var(--amber); width:14px; height:14px; flex-shrink:0;}
-.subtask-item__title{flex:1; color:var(--text-hi);}
+.subtask-item__title{flex:1 1 140px; min-width:100px; color:var(--text-hi);}
 .subtask-item.done .subtask-item__title{color:var(--text-faint); text-decoration:line-through;}
-.subtask-item__date{background:var(--ink-900); border:1px solid var(--line); border-radius:5px; color:var(--text-lo); font-family:var(--font-mono); font-size:10px; padding:3px 4px; width:110px;}
-.subtask-badge{font-family:var(--font-mono); font-size:10px; color:var(--text-lo); background:var(--ink-700); border-radius:10px; padding:2px 7px;}
+.subtask-item__date{background:var(--ink-900); border:1px solid var(--line); border-radius:5px; color:var(--text-lo); font-family:var(--font-mono); font-size:10px; padding:3px 4px; width:100px; flex-shrink:0;}
+.subtask-item select{flex-shrink:0; max-width:88px; font-size:11px; padding:3px 4px;}
+.subtask-badge{display:inline-flex; align-items:center; gap:3px; font-family:var(--font-mono); font-size:10px; color:var(--text-lo); background:var(--ink-700); border:1px solid transparent; border-radius:10px; padding:2px 7px; cursor:pointer;}
+.subtask-badge:hover{border-color:var(--amber);}
+.subtask-badge.is-open{color:var(--amber); background:var(--amber-dim);}
+.subtask-badge__caret{font-size:8px;}
+.task-row-wrap{display:flex; flex-direction:column; gap:0;}
+.subtask-quickview{display:flex; flex-direction:column; gap:4px; margin:4px 0 2px 8px; padding:6px 10px; background:var(--ink-900); border-left:2px solid var(--line); border-radius:0 6px 6px 0;}
+.subtask-quickview__item{display:flex; align-items:center; gap:8px; font-size:11px;}
+.subtask-quickview__item input[type=checkbox]{accent-color:var(--amber); width:12px; height:12px; flex-shrink:0;}
+.subtask-quickview__title{flex:1; color:var(--text-hi); cursor:pointer; min-width:80px;}
+.subtask-quickview__item.done .subtask-quickview__title{color:var(--text-faint); text-decoration:line-through;}
+.subtask-quickview__date{font-family:var(--font-mono); font-size:10px; color:var(--text-faint); flex-shrink:0;}
+.subtask-quickview__duration{font-family:var(--font-mono); font-size:10px; color:var(--text-lo); background:var(--ink-700); border-radius:8px; padding:1px 6px; flex-shrink:0;}
 
 ::-webkit-scrollbar{width:8px; height:8px;}
 ::-webkit-scrollbar-thumb{background:var(--ink-700); border-radius:8px;}
-
-/* ============================== Claude Assistant chat panel ============================== */
-.chat-fab{
-  position:fixed;
-  bottom:24px;
-  right:24px;
-  width:52px;
-  height:52px;
-  border-radius:50%;
-  border:none;
-  background:var(--amber);
-  color:var(--ink-950);
-  font-size:20px;
-  cursor:pointer;
-  box-shadow:0 6px 20px rgba(0,0,0,.35);
-  z-index:1000;
-  transition:transform .1s, filter .15s;
-}
-.chat-fab:hover{filter:brightness(1.08);}
-.chat-fab:active{transform:scale(.96);}
-
-.chat-panel{
-  position:fixed;
-  bottom:88px;
-  right:24px;
-  width:360px;
-  max-width:calc(100vw - 32px);
-  height:520px;
-  max-height:calc(100vh - 120px);
-  display:flex;
-  flex-direction:column;
-  background:var(--ink-900);
-  border:1px solid var(--line);
-  border-radius:12px;
-  box-shadow:0 12px 40px rgba(0,0,0,.45);
-  z-index:1000;
-  overflow:hidden;
-}
-.chat-panel__head{
-  display:flex;
-  align-items:flex-start;
-  justify-content:space-between;
-  padding:14px 16px;
-  border-bottom:1px solid var(--line);
-}
-.chat-panel__body{
-  flex:1;
-  overflow-y:auto;
-  padding:14px 16px;
-  display:flex;
-  flex-direction:column;
-  gap:10px;
-}
-.chat-panel__input{
-  display:flex;
-  gap:8px;
-  padding:12px;
-  border-top:1px solid var(--line);
-}
-.chat-panel__input input{flex:1; min-width:0;}
-
-.chat-bubble{
-  max-width:88%;
-  padding:8px 12px;
-  border-radius:10px;
-  font-size:13px;
-  line-height:1.5;
-}
-.chat-bubble p{margin:0;}
-.chat-bubble p + p{margin-top:6px;}
-.chat-bubble--user{align-self:flex-end; background:var(--amber-dim);}
-.chat-bubble--assistant{align-self:flex-start; background:var(--ink-800); border:1px solid var(--line);}
-.chat-bubble__tool-chip{
-  display:inline-block;
-  margin-top:4px;
-  font-family:var(--font-mono);
-  font-size:10px;
-  color:var(--text-lo);
-  background:var(--ink-700);
-  border-radius:6px;
-  padding:2px 8px;
-}
-
-.chat-confirm-card{
-  align-self:stretch;
-  border:1px solid var(--amber);
-  background:var(--amber-dim);
-  border-radius:10px;
-  padding:10px 12px;
-}
-.chat-confirm-card--danger{border-color:var(--red); background:var(--red-dim);}
-.chat-confirm-card__desc{margin:0 0 8px; font-size:13px; color:var(--text-hi);}
-.chat-confirm-card__actions{display:flex; gap:8px; justify-content:flex-end;}
-
-/* ============================== Interactive day-plan rows ============================== */
-/* Rearrange (time/duration), remove, or delay a suggested block right in the modal. */
-.today-item--editable{
-  display:flex;
-  align-items:center;
-  flex-wrap:wrap;
-  gap:8px;
-}
-.today-item--editable select{font-size:12px;}
-.today-item--editable .today-item__title{flex:1 1 140px;}
