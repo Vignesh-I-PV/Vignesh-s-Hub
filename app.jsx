@@ -853,10 +853,53 @@ function StickyNotesPanel({ notes, onAdd, onDelete, onFile }){
       {notes.length > 0 && (
         <div className="sticky-note-list">
           {notes.map(n => (
-            <div key={n.id} className="sticky-note">
-              <span>{n.text}</span>
-              <button className="btn" style={{ fontSize: 10, padding: '4px 8px' }} onClick={() => onFile(n.id)}>File this</button>
-              <button className="icon-btn" title="Discard" onClick={() => onDelete(n.id)}>&times;</button>
+            <div key={n.id} className="sticky-note tone-warm">
+              <p className="sticky-note__text">{n.text}</p>
+              <div className="sticky-note__actions">
+                <button title="File this into a task or meeting" onClick={() => onFile(n.id)}>File</button>
+                <button className="sticky-note__del" title="Discard" onClick={() => onDelete(n.id)}>&times;</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// A separate, calmer scratchpad for things that just want to be kept, not filed
+// anywhere — no "File this" action, no end-of-day nagging, just persistent notes.
+function IdeaBoardPanel({ notes, onAdd, onDelete }){
+  const [text, setText] = useState('');
+
+  function submit(){
+    if (!text.trim()) return;
+    onAdd(text.trim());
+    setText('');
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel__head" style={{ marginBottom: 10 }}>
+        <div>
+          <p className="panel__eyebrow">Ideas</p>
+          <h2 className="panel__title">Just for keeping — nothing to file here</h2>
+        </div>
+      </div>
+      <div className="quick-add-row">
+        <input type="text" placeholder="A thought worth keeping around…" value={text}
+          onChange={e => setText(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); }} style={{ flex: '3 1 260px' }} />
+        <button className="btn btn--amber" onClick={submit}>Add idea</button>
+      </div>
+      {notes.length > 0 && (
+        <div className="sticky-note-list">
+          {notes.map(n => (
+            <div key={n.id} className="sticky-note tone-cool">
+              <p className="sticky-note__text">{n.text}</p>
+              <div className="sticky-note__actions" style={{ justifyContent: 'flex-end' }}>
+                <button className="sticky-note__del" title="Discard" onClick={() => onDelete(n.id)}>&times;</button>
+              </div>
             </div>
           ))}
         </div>
@@ -879,9 +922,9 @@ function EndOfDayModal({ notes, onClose, onFile }){
           <p style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-lo)', marginBottom: 10 }}>
             Move these into a task, a meeting's agenda, or wherever they belong — otherwise they'll remind you again first thing tomorrow.
           </p>
-          <div className="sticky-note-list">
+          <div className="filing-list">
             {notes.map(n => (
-              <div key={n.id} className="sticky-note">
+              <div key={n.id} className="filing-row">
                 <span>{n.text}</span>
                 <button className="btn" style={{ fontSize: 10, padding: '4px 8px' }} onClick={() => onFile(n.id)}>File this</button>
               </div>
@@ -2872,9 +2915,9 @@ function DailyPlannerModal({ defaultWorkingHours, todayMeetings, todayTasks, cat
         {unfiledNotes.length > 0 && (
           <div className="modal-field">
             <label style={{ color: 'var(--amber)' }}>Unfiled notes from before</label>
-            <div className="sticky-note-list">
+            <div className="filing-list">
               {unfiledNotes.map(n => (
-                <div key={n.id} className="sticky-note">
+                <div key={n.id} className="filing-row">
                   <span>{n.text}</span>
                   <button className="icon-btn" title="Filed elsewhere — remove" onClick={() => onDeleteNote(n.id)}>&times;</button>
                 </div>
@@ -3294,6 +3337,7 @@ function App(){
   const [digestOpen, setDigestOpen] = useState(false);
   const [oooRanges, setOooRanges] = useState({});
   const [stickyNotes, setStickyNotes] = useState([]);
+  const [ideaNotes, setIdeaNotes] = useState([]);
   const [filingNoteId, setFilingNoteId] = useState(null);
   const [lastEodPromptDate, setLastEodPromptDate] = useState('');
   const [eodModalOpen, setEodModalOpen] = useState(false);
@@ -3332,6 +3376,7 @@ function App(){
     setDefaultWorkingHours(parsed.defaultWorkingHours || { start: '09:00', end: '18:00' });
     setOooRanges(parsed.oooRanges || {});
     setStickyNotes(parsed.stickyNotes || []);
+    setIdeaNotes(parsed.ideaNotes || []);
     setLastEodPromptDate(parsed.lastEodPromptDate || '');
     return { lastVisitDate: parsed.lastVisitDate || '', lastDigestWeek: parsed.lastDigestWeek || '' };
   }
@@ -3462,7 +3507,7 @@ function App(){
       const payload = {
         categories, categoryCounter, meetingTypes, meetings, tasks, quickLinks, linkTags,
         pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours,
-        lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate
+        lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, ideaNotes, lastEodPromptDate
       };
       supabaseClient
         .from('app_state')
@@ -3474,7 +3519,7 @@ function App(){
         });
     }, 800);
     return () => clearTimeout(saveTimer.current);
-  }, [categories, categoryCounter, meetingTypes, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, lastEodPromptDate, loaded, session]);
+  }, [categories, categoryCounter, meetingTypes, meetings, tasks, quickLinks, linkTags, pendingMeetings, plannedMeetings, settings, workingHours, defaultWorkingHours, lastVisitDate, lastDigestWeek, oooRanges, stickyNotes, ideaNotes, lastEodPromptDate, loaded, session]);
 
   function signOut(){
     supabaseClient.auth.signOut();
@@ -4059,6 +4104,12 @@ function App(){
   function deleteStickyNote(id){
     setStickyNotes(ns => ns.filter(n => n.id !== id));
   }
+  function addIdeaNote(text){
+    setIdeaNotes(ns => [...ns, { id: uid(), text, createdAt: todayISO() }]);
+  }
+  function deleteIdeaNote(id){
+    setIdeaNotes(ns => ns.filter(n => n.id !== id));
+  }
   function fileNoteAsTask(noteId, categoryId){
     const note = stickyNotes.find(n => n.id === noteId);
     if (!note) return;
@@ -4250,6 +4301,8 @@ function App(){
           <ProgressPanel dailyProgress={dailyProgress} weeklyProgress={weeklyProgress} timeElapsedPercent={timeElapsedPercent} weekElapsedPercent={weekElapsedPercent} />
 
           <StickyNotesPanel notes={stickyNotes} onAdd={addStickyNote} onDelete={deleteStickyNote} onFile={setFilingNoteId} />
+
+          <IdeaBoardPanel notes={ideaNotes} onAdd={addIdeaNote} onDelete={deleteIdeaNote} />
 
           {upcomingDeadlines.length > 0 && (
             <section className="panel deadlines-panel">
