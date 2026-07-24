@@ -6,11 +6,18 @@
 <title>Control Centre</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css">
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
+<!--
+  styles.css is written via document.write with a cache-busting query string, instead
+  of a plain <link> tag, so a new deploy is never masked by the browser's HTTP cache —
+  otherwise "the site looks unchanged after I pushed" is a recurring support question.
+  document.write is safe here specifically because it runs synchronously while the
+  document is still being parsed (before <body>), not after load.
+-->
+<script>document.write('<link rel="stylesheet" href="styles.css?v=' + Date.now() + '">');</script>
 
 <!-- React + JSX transform, loaded from CDN so there's no build step -->
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
@@ -34,7 +41,7 @@
   build loaded above.
 -->
 <script>
-  fetch('app.jsx')
+  fetch('app.jsx?v=' + Date.now())
     .then(res => res.text())
     .then(code => {
       const output = Babel.transform(code, {
