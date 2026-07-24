@@ -302,10 +302,33 @@ body{
 .digest-item__code{font-family:var(--font-mono); font-size:9px; color:var(--text-faint); letter-spacing:.05em; min-width:44px;}
 
 /* ---------- Sticky notes ---------- */
-.sticky-note-list{display:flex; flex-direction:column; gap:6px; margin-top:10px;}
-.sticky-note{display:flex; justify-content:space-between; align-items:center; gap:10px; background:var(--amber-dim); border:1px solid var(--amber); border-radius:6px; padding:7px 10px; font-size:13px; color:var(--text-hi);}
-.sticky-note button{background:none; border:none; color:var(--text-lo); cursor:pointer; font-size:13px;}
-.sticky-note button:hover{color:var(--red);}
+.sticky-note-list{display:flex; flex-wrap:wrap; gap:16px 14px; margin-top:14px; padding:4px 2px 8px;}
+.sticky-note{
+  position:relative; width:158px; min-height:120px;
+  padding:14px 12px 34px; border-radius:3px 3px 8px 3px;
+  font-family:var(--font-body); font-size:12.5px; line-height:1.45; color:#2B2A25;
+  box-shadow:0 8px 16px rgba(0,0,0,.32), 0 1px 0 rgba(255,255,255,.25) inset;
+  transform:rotate(var(--tilt, -2deg));
+  transition:transform .18s ease, box-shadow .18s ease;
+  word-break:break-word;
+}
+.sticky-note:hover{transform:rotate(0deg) scale(1.045); box-shadow:0 12px 22px rgba(0,0,0,.4), 0 1px 0 rgba(255,255,255,.25) inset; z-index:2;}
+.sticky-note::after{content:''; position:absolute; right:0; bottom:0; width:16px; height:16px; background:linear-gradient(135deg, transparent 50%, rgba(0,0,0,.16) 50%); border-radius:0 0 8px 0;}
+.sticky-note__text{margin:0; white-space:pre-wrap;}
+.sticky-note__actions{position:absolute; left:12px; right:14px; bottom:9px; display:flex; align-items:center; justify-content:space-between; gap:6px;}
+.sticky-note__actions button{background:rgba(0,0,0,.08); border:none; border-radius:4px; color:#2B2A25; cursor:pointer; font-family:var(--font-mono); font-size:9px; font-weight:600; padding:3px 6px; letter-spacing:.02em;}
+.sticky-note__actions button:hover{background:rgba(0,0,0,.18);}
+.sticky-note__actions .sticky-note__del{background:none; font-size:14px; line-height:1; padding:2px 4px;}
+.sticky-note__actions .sticky-note__del:hover{color:#B5372C;}
+.sticky-note.tone-warm:nth-child(4n+1){background:#F3CE6B; --tilt:-2deg;}
+.sticky-note.tone-warm:nth-child(4n+2){background:#8FDDB8; --tilt:1.6deg;}
+.sticky-note.tone-warm:nth-child(4n+3){background:#F0A8A0; --tilt:-1.3deg;}
+.sticky-note.tone-warm:nth-child(4n+4){background:#E4C1F2; --tilt:2.2deg;}
+.sticky-note.tone-cool:nth-child(3n+1){background:#9FD8EE; --tilt:-2deg;}
+.sticky-note.tone-cool:nth-child(3n+2){background:#B7C8F2; --tilt:1.8deg;}
+.sticky-note.tone-cool:nth-child(3n+3){background:#C6E6D6; --tilt:-1.5deg;}
+.filing-list{display:flex; flex-direction:column; gap:6px;}
+.filing-row{display:flex; justify-content:space-between; align-items:center; gap:10px; background:var(--amber-dim); border:1px solid var(--amber); border-radius:6px; padding:7px 10px; font-size:13px; color:var(--text-hi);}
 
 /* ---------- Sub-tasks ---------- */
 .subtask-list{display:flex; flex-direction:column; gap:6px; margin-bottom:8px;}
